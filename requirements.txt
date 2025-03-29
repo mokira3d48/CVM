@@ -1,0 +1,11 @@
+numpy
+matplotlib
+tqdm
+torch
+torchvision
+
+python-dotenv==1.0.0
+pytest==8.2
+setuptools>=42
+wheel
+autopep8
