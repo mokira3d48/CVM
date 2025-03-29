@@ -296,7 +296,7 @@ def validate(model, val_loader, criterion, device):
     
     with torch.no_grad():
         end = time.time()
-        loader = tqdm(val_loader, desc="Validation")
+        loader = tqdm(val_loader, desc=" Validation")
         for i, (inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(device), targets.to(device)
 
@@ -470,6 +470,7 @@ def train_license_plate_model(args):
 
         # Print epoch statistics
         # print(f'Epoch: {epoch+1}/{args.epochs}')
+        print("")
         print(f'Train Loss: {train_loss:.8f}, Train Acc: {train_acc.item():.2f}%')
         print(f'Val Loss: {val_loss:.8f}, Val Acc: {val_acc.item():.2f}%')
         print(f'Best Val Acc: {best_acc.item():.2f}%')
