@@ -105,6 +105,101 @@ class AlexNetLicensePlate(nn.Module):
                 nn.init.normal_(m.weight, mean=0, std=0.01)
                 nn.init.constant_(m.bias, 0)
 
+    def replace_classifier(self, num_classes):
+        """
+        Replace the final classification layer with a new one that has the specified number of output classes
+        
+        Args:
+            num_classes (int): Number of classes for the new classification layer
+        """
+        # Create a new fully connected layer for classification
+        self.fc3 = nn.Sequential(nn.Linear(4096, num_classes))
+        
+        # Initialize the weights of the new layer
+        for m in self.fc3.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0, std=0.01)
+                nn.init.constant_(m.bias, 0)
+        
+        return self
+
+def fine_tune_model(
+    pretrained_model_path, num_new_classes, freeze_feature_layers=True
+):
+    """
+    Load a pre-trained model and modify it for fine-tuning on a new dataset with different number of classes
+    
+    Args:
+        pretrained_model_path (str): Path to the pre-trained model checkpoint
+        num_new_classes (int): Number of classes in the new dataset
+        freeze_feature_layers (bool): Whether to freeze the feature extraction layers
+        
+    Returns:
+        model: Modified model ready for fine-tuning
+        optimizer: Configured optimizer for fine-tuning
+    """
+    # Load the checkpoint
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(pretrained_model_path, map_location='cpu')
+    
+    # Get the original number of classes 
+    # Assuming the last layer in state_dict has shape [original_num_classes, 4096]
+    state_dict = checkpoint['state_dict']
+    original_layer_name = None
+    original_num_classes = None
+    
+    # Find the final classification layer
+    for key in state_dict.keys():
+        if 'fc3.0.weight' in key:
+            original_layer_name = key
+            original_num_classes = state_dict[key].shape[0]
+            break
+    
+    if original_num_classes is None:
+        raise ValueError(
+            "Could not determine the number of classes in the pre-trained model")
+    
+    print(f"Original model had {original_num_classes} output classes")
+    print(f"New model will have {num_new_classes} output classes")
+
+    # Create a model with the original number of classes first
+    model = AlexNetLicensePlate(num_classes=original_num_classes)
+    
+    # Load all the weights from the checkpoint
+    model.load_state_dict(checkpoint['state_dict'])
+    
+    # Now replace the classifier with a new one for the target number of classes
+    model.replace_classifier(num_new_classes)
+    
+    # Freeze feature extraction layers if specified
+    if freeze_feature_layers:
+        for name, param in model.named_parameters():
+            if any(layer_name in name for layer_name in ['layer1', 'layer2', 'layer3', 'layer4', 'layer5']):
+                param.requires_grad = False
+
+    # Configure optimizer with different learning rates for different parts of the network
+    feature_params = []
+    fc1_fc2_params = []
+    fc3_params = []
+    
+    for name, param in model.named_parameters():
+        if 'fc3' in name:
+            fc3_params.append(param)
+        elif 'fc1' in name or 'fc2' in name:
+            fc1_fc2_params.append(param)
+        else:
+            feature_params.append(param)
+
+    # Use different learning rates for different parts of the network
+    optimizer = optim.Adam([
+        {'params': feature_params, 'lr': 1e-5},     # Very low learning rate for frozen feature layers
+        {'params': fc1_fc2_params, 'lr': 1e-4},     # Medium learning rate for FC1 and FC2
+        {'params': fc3_params, 'lr': 1e-3}          # High learning rate for the new classification layer
+    ], weight_decay=1e-4)
+
+    return model, optimizer
+
+
 class AverageMeter:
     """Computes and stores the average and current value"""
     def __init__(self):
@@ -205,7 +300,7 @@ def get_dataloaders(args):
         root_dir=args.data_dir,
         transform=train_transform
     )
-    
+
     train_size = int(0.9 * len(base_dataset))
     val_size = len(base_dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(
@@ -410,23 +505,23 @@ def train_license_plate_model(args):
     
     # Create model - for digits we use 35 classes (0-9) and (A-Z)
     model = AlexNetLicensePlate(num_classes=35, dropout=args.dropout)
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
     if args.weights and os.path.isfile(args.weights):
         # weights = torch.load(args.weights)
         # model.load_state_dict(weights)
-        load_checkpoint(args.weights, model)
-        model.fc3 = nn.Sequential(nn.Linear(4096, 37))
+        #load_checkpoint(args.weights, model)
+        #model.fc3 = nn.Sequential(nn.Linear(4096, 37))
+        model, optimizer = fine_tune_model(args.weights, 37, True)
 
     model = model.to(device)
     summary(model, input_shape=(args.batch_size, 3, 96, 128))
     
     # Define loss function and optimizer
     criterion = nn.CrossEntropyLoss()
-    
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay
-    )
     
     # Learning rate scheduler
     scheduler = ReduceLROnPlateau(
