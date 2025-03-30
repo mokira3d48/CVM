@@ -1,0 +1,2 @@
+python classifications/alexnet.py  -n 600 --b 256 -lr 1e-6 --plot-results -d "/home/mokira3d48/Documents/datasets/License Plate Digits Classification Dataset/CNN letter Dataset/" -r checkpoints/checkpoint.pth
+

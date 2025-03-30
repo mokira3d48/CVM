@@ -242,13 +242,13 @@ def fine_tune_model(
 
     # Use different learning rates for different parts of the network
     optimizer = optim.Adam([
-        {'params': feature_params, 'lr': 1e-5},
+        {'params': feature_params, 'lr': 1e-6},
         #: Very low learning rate for frozen feature layers
 
-        {'params': fc1_fc2_params, 'lr': 1e-4},
+        {'params': fc1_fc2_params, 'lr': 1e-5},
         #: Medium learning rate for FC1 and FC2
 
-        {'params': fc3_params, 'lr': 1e-3}
+        {'params': fc3_params, 'lr': 1e-4}
         #: High learning rate for the new classification layer
     ], weight_decay=1e-4)
 
@@ -330,7 +330,8 @@ def get_data_loaders(args, train_set_percent=0.85):
     x_base, y_base, class_names = load_dataset_samples(args.data_dir)
     # base_dataset = ImagesDataset(base_samples)
 
-    data = train_test_split(x_base, y_base, test_size=1.0 - train_set_percent)
+    test_probs = 1.0 - train_set_percent
+    data = train_test_split(x_base, y_base, test_size=test_probs)
     x_train = data[0]
     x_valid = data[1]
     y_train = data[2]
@@ -567,15 +568,16 @@ def model_train(args):
     model = AlexNet(num_classes=num_class_names, dropout=args.dropout)
     optimizer = optim.Adam(
         model.parameters(),
-        lr=args.lr,
+        lr=args.learning_rate,
         weight_decay=args.weight_decay
     )
-    if args.weights and os.path.isfile(args.weights):
+    if args.model and os.path.isfile(args.model):
         # weights = torch.load(args.weights)
         # model.load_state_dict(weights)
         # load_checkpoint(args.weights, model)
         # model.fc3 = nn.Sequential(nn.Linear(4096, 37))
-        model, optimizer = fine_tune_model(args.weights, num_class_names)
+        model, optimizer = fine_tune_model(
+            args.model, num_class_names, args.feeze_feature_layers)
 
     model = model.to(device)
     summary(model, input_shape=(args.batch_size, 3, 96, 128))
@@ -603,40 +605,46 @@ def model_train(args):
 
     # Training loop
     for epoch in range(start_epoch, args.epochs):
-        print(
-            "\n"
-            f"Start training epoch: {epoch + 1}/{args.epochs}"
-            f" with lr: {scheduler.get_last_lr()[0]}")
-        # Train for one epoch
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, epoch, device
-        )
+        try:
+            print(
+                "\n"
+                f"Start training epoch: {epoch + 1}/{args.epochs}"
+                f" with lr: {scheduler.get_last_lr()[0]}")
+            # Train for one epoch
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, criterion, optimizer, epoch, device
+            )
 
-        # Evaluate on validation set
-        val_loss, val_acc = validate(model, valid_loader, criterion, device)
+            # Evaluate on validation set
+            val_loss, val_acc = validate(
+                model, valid_loader, criterion, device)
 
-        # Adjust learning rate
-        scheduler.step(val_acc)
+            # Adjust learning rate
+            scheduler.step(val_acc)
 
-        # Remember best accuracy and save checkpoint
-        is_best = val_acc > best_acc
-        best_acc = max(val_acc, best_acc)
+            # Remember best accuracy and save checkpoint
+            is_best = val_acc > best_acc
+            best_acc = max(val_acc, best_acc)
 
-        save_checkpoint({
-            'epoch': epoch + 1,
-            'state_dict': model.state_dict(),
-            'best_acc': best_acc,
-            'optimizer': optimizer.state_dict(),
-        }, is_best, args.checkpoint_dir)
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'state_dict': model.state_dict(),
+                'best_acc': best_acc,
+                'optimizer': optimizer.state_dict(),
+            }, is_best, args.checkpoint_dir)
 
-        # Print epoch statistics
-        # print(f'Epoch: {epoch+1}/{args.epochs}')
-        print("")
-        print(
-            f'Train Loss: {train_loss:.8f}, Train Acc: {train_acc.item():.2f}%')
-        print(f'Val Loss: {val_loss:.8f}, Val Acc: {val_acc.item():.2f}%')
-        print(f'Best Val Acc: {best_acc.item():.2f}%')
-        print('-' * 80)
+            # Print epoch statistics
+            # print(f'Epoch: {epoch+1}/{args.epochs}')
+            print("")
+            print(
+                f'Train Loss: {train_loss:.8f},'
+                f'Train Acc: {train_acc.item():.2f}%')
+            print(f'Val Loss: {val_loss:.8f}, Val Acc: {val_acc.item():.2f}%')
+            print(f'Best Val Acc: {best_acc.item():.2f}%')
+            print('-' * 80)
+        except KeyboardInterrupt:
+            print("Training process is canceled by user.")
+            break
 
     # Load best model for final evaluation
     best_model_path = os.path.join(args.checkpoint_dir, 'best.pt')
@@ -645,11 +653,15 @@ def model_train(args):
     model.load_state_dict(weights)
 
     # Run inference on test set
+    print("\n")
+    print("Inference start...")
     test_acc, predictions, targets = inference(model, test_loader, device)
     print(f'Test Acc: {test_acc.item():.2f}%')
 
     # Plot confusion matrix and classification report
     if args.plot_results:
+        print("\n")
+        print("Results plotting...", end=' ')
         cm = confusion_matrix(targets, predictions)
         plt.figure(figsize=(10, 8))
         plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
@@ -673,10 +685,11 @@ def model_train(args):
         plt.xlabel('Predicted Label')
         plt.tight_layout()
         plt.savefig(os.path.join(args.checkpoint_dir, 'confusion_matrix.png'))
+        print("Done!")
 
         # Print classification report
         classes = np.unique(targets)
-        classes = [str(i) for i in classes]
+        classes = [class_names[i] for i in classes]
         report = classification_report(
             targets, predictions, target_names=classes, zero_division=0)
         print("Classification Report:")
@@ -695,20 +708,23 @@ def main():
         description='License Plate Digit Classification with AlexNet')
 
     # Dataset parameters
-    parser.add_argument('--data-dir', type=str, required=True,
+    parser.add_argument('-d', '--data-dir', type=str, required=True,
                         help='data directory (default: ./license_plate_digits)')
 
     # Model parameters
     parser.add_argument('--dropout', default=0.5, type=float,
                         help='dropout probability (default: 0.5)')
-    parser.add_argument('--weights', type=str, help="Existing model file.")
+    parser.add_argument('-m', '--model', type=str, help="Existing model file.")
+    parser.add_argument(
+        '-ffl', '--feeze-feature-layers', action="store_true",
+        help="Existing model file.")
 
     # Training parameters
-    parser.add_argument('--epochs', default=50, type=int,
+    parser.add_argument('-n', '--epochs', default=50, type=int,
                         help='number of total epochs to run (default: 50)')
-    parser.add_argument('--batch-size', default=64, type=int,
+    parser.add_argument('-b', '--batch-size', default=64, type=int,
                         help='mini-batch size (default: 64)')
-    parser.add_argument('--lr', default=0.001, type=float,
+    parser.add_argument('-lr', '--learning-rate', default=0.001, type=float,
                         help='initial learning rate (default: 0.001)')
     parser.add_argument('--weight-decay', default=1e-4, type=float,
                         help='weight decay (default: 1e-4)')
@@ -716,10 +732,10 @@ def main():
                         help='patience for learning rate reduction (default: 5)')
 
     # Checkpoint parameters
-    parser.add_argument('--resume', default='', type=str,
-                        help='path to latest checkpoint (default: none)')
+    parser.add_argument('-r', '--resume', default='', type=str,
+                        help='Path to latest checkpoint (default: none)')
     parser.add_argument(
-        '--checkpoint-dir', default='./license_plate_checkpoints', type=str,
+        '-ckpt', '--checkpoint-dir', default='./checkpoints', type=str,
         help='checkpoint directory (default: ./license_plate_checkpoints)')
 
     # Misc parameters
