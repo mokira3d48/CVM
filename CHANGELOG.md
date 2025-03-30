@@ -5,6 +5,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- Alexnet model training, validation and evaluation;
+- Possibility to cancel the training loop and to pass directly to inference;
 
 ### Changed
 
