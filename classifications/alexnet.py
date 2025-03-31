@@ -5,6 +5,7 @@ __version__ = '0.1.0'
 __auther__ = 'Arnold Mokira'
 
 import os
+import json
 import argparse
 from time import time
 
@@ -165,9 +166,36 @@ class AlexNet(nn.Module):
 
         return self
 
+    def optimizer(self, lrs):
+        # Configure optimizer with different learning rates
+        # for different parts of the network.
+        feature_params = []
+        fc1_fc2_params = []
+        fc3_params = []
+
+        for name, param in self.named_parameters():
+            if 'fc3' in name:
+                fc3_params.append(param)
+            elif 'fc1' in name or 'fc2' in name:
+                fc1_fc2_params.append(param)
+            else:
+                feature_params.append(param)
+
+        optimizer = optim.Adam([
+            {'params': feature_params, 'lr': lrs[0]},
+            #: Very low learning rate for frozen feature layers
+
+            {'params': fc1_fc2_params, 'lr': lrs[1]},
+            #: Medium learning rate for FC1 and FC2
+
+            {'params': fc3_params, 'lr': lrs[2]}
+            #: High learning rate for the new classification layer
+        ], weight_decay=1e-4)
+        return optimizer
+
 
 def fine_tune_model(
-    pretrained_model_path, num_new_classes, freeze_feature_layers=True
+    pretrained_model_path, num_new_classes, lr, freeze_feature_layers=True
 ):
     """
     Load a pre-trained model and modify it for fine-tuning
@@ -175,11 +203,14 @@ def fine_tune_model(
 
     :param pretrained_model_path: Path to the pre-trained model file path.
     :param num_new_classes: Number of classes in the new dataset.
+    :param lr: The base learning rate will be used to config optimizer
+        with the deference layers learning rate.
     :param freeze_feature_layers: Whether to freeze the feature
         extraction layers.
 
     :type pretrained_model_path: `str`
     :type num_new_classes: `int`
+    :type lr: `float`
     :type freeze_feature_layers: `bool`
 
     :returns:
@@ -226,32 +257,7 @@ def fine_tune_model(
                    ['layer1', 'layer2', 'layer3', 'layer4', 'layer5']):
                 param.requires_grad = False
 
-    # Configure optimizer with different learning rates
-    # for different parts of the network.
-    feature_params = []
-    fc1_fc2_params = []
-    fc3_params = []
-
-    for name, param in model.named_parameters():
-        if 'fc3' in name:
-            fc3_params.append(param)
-        elif 'fc1' in name or 'fc2' in name:
-            fc1_fc2_params.append(param)
-        else:
-            feature_params.append(param)
-
-    # Use different learning rates for different parts of the network
-    optimizer = optim.Adam([
-        {'params': feature_params, 'lr': 1e-6},
-        #: Very low learning rate for frozen feature layers
-
-        {'params': fc1_fc2_params, 'lr': 1e-5},
-        #: Medium learning rate for FC1 and FC2
-
-        {'params': fc3_params, 'lr': 1e-4}
-        #: High learning rate for the new classification layer
-    ], weight_decay=1e-4)
-
+    optimizer = model.optimizer((lr * 0.01, lr * 0.1, lr))
     return model, optimizer
 
 
@@ -326,24 +332,97 @@ class ImagesDataset(Dataset):
         return img, target
 
 
+def dataset_cache_save(train, valid, test, class_names, ckpt_dir):
+    x_train, y_train = train
+    x_valid, y_valid = valid
+    x_test, y_test = test
+
+    train_file_cache = os.path.join(ckpt_dir, 'train.cach')
+    valid_file_cache = os.path.join(ckpt_dir, 'valid.cach')
+    test_file_cache = os.path.join(ckpt_dir, 'test.cach')
+
+    with open(train_file_cache, mode='w', encoding='utf-8') as file1:
+        train_dict = {
+            'features': x_train,
+            'labels': y_train,
+            'classes': class_names}
+        train_json = json.dumps(train_dict, indent=4)
+        file1.write(train_json)
+
+    with open(valid_file_cache, mode='w', encoding='utf-8') as file2:
+        valid_dict = {
+            'features': x_valid, 'labels': y_valid, 'classes': class_names}
+        valid_json = json.dumps(valid_dict, indent=4)
+        file2.write(valid_json)
+
+    with open(test_file_cache, mode='w', encoding='utf-8') as file3:
+        test_dict = {
+            'features': x_test, 'labels': y_test, 'classes': class_names}
+        test_json = json.dumps(test_dict, indent=4)
+        file3.write(test_json)
+
+
+def dataset_cache_load(ckpt_dir):
+    train_file_cache = os.path.join(ckpt_dir, 'train.cach')
+    valid_file_cache = os.path.join(ckpt_dir, 'valid.cach')
+    test_file_cache = os.path.join(ckpt_dir, 'test.cach')
+
+    for file in [train_file_cache, valid_file_cache, test_file_cache]:
+        if not os.path.isfile(file):
+            print(f"No dataset cache found at {ckpt_dir}")
+            return None
+
+    train = tuple()
+    valid = tuple()
+    test = tuple()
+    class_names = []
+
+    with open(train_file_cache, mode='r', encoding='utf-8') as file1:
+        train_dict = json.load(file1)
+        train = (train_dict['features'], train_dict['labels'])
+        class_names = train_dict['classes']
+
+    with open(valid_file_cache, mode='r', encoding='utf-8') as file2:
+        valid_dict = json.load(file2)
+        valid = (valid_dict['features'], valid_dict['labels'])
+
+    with open(test_file_cache, mode='r', encoding='utf-8') as file3:
+        test_dict = json.load(file3)
+        test = (test_dict['features'], test_dict['labels'])
+
+    return (train, valid, test), class_names
+
+
 def get_data_loaders(args, train_set_percent=0.85):
-    x_base, y_base, class_names = load_dataset_samples(args.data_dir)
-    # base_dataset = ImagesDataset(base_samples)
+    returned = dataset_cache_load(args.checkpoint_dir)
+    if not returned:
+        x_base, y_base, class_names = load_dataset_samples(args.data_dir)
+        # base_dataset = ImagesDataset(base_samples)
 
-    test_probs = 1.0 - train_set_percent
-    data = train_test_split(x_base, y_base, test_size=test_probs)
-    x_train = data[0]
-    x_valid = data[1]
-    y_train = data[2]
-    y_valid = data[3]
+        test_probs = 1.0 - train_set_percent
+        data = train_test_split(x_base, y_base, test_size=test_probs)
+        x_train = data[0]
+        x_valid = data[1]
+        y_train = data[2]
+        y_valid = data[3]
 
-    # test_size = int(0.5 * val_size)
-    # val_size = val_size - test_size
-    data = train_test_split(x_valid, y_valid, test_size=0.5)
-    x_valid = data[0]
-    x_test = data[1]
-    y_valid = data[2]
-    y_test = data[3]
+        # test_size = int(0.5 * val_size)
+        # val_size = val_size - test_size
+        data = train_test_split(x_valid, y_valid, test_size=0.5)
+        x_valid = data[0]
+        x_test = data[1]
+        y_valid = data[2]
+        y_test = data[3]
+
+        dataset_cache_save(
+            (x_train, y_train), (x_valid, y_valid), (x_test, y_test),
+            class_names, args.checkpoint_dir)
+    else:
+        samples, class_names = returned
+        train, valid, test = samples
+        x_train, y_train = train
+        x_valid, y_valid = valid
+        x_test, y_test = test
 
     train_dataset = ImagesDataset(x_train, y_train, train_transform)
     valid_dataset = ImagesDataset(x_valid, y_valid, valid_transform)
@@ -353,8 +432,7 @@ def get_data_loaders(args, train_set_percent=0.85):
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        )
+        num_workers=args.num_workers)
 
     valid_loader = DataLoader(
         valid_dataset,
@@ -538,7 +616,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None):
             optimizer.load_state_dict(checkpoint['optimizer'])
         print(
             f"=> Loaded checkpoint '{checkpoint_path}'"
-            f" (epoch {checkpoint['epoch']})")
+            f" (epoch {checkpoint['epoch'] + 1})")
         return checkpoint
     else:
         print(f"=> No checkpoint found at '{checkpoint_path}'")
@@ -566,21 +644,24 @@ def model_train(args):
 
     # Create model - for digits we use 35 classes (0-9) and (A-Z)
     model = AlexNet(num_classes=num_class_names, dropout=args.dropout)
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay
-    )
+    # optimizer = optim.Adam(
+    #    model.parameters(),
+    #    lr=args.learning_rate,
+    #    weight_decay=args.weight_decay
+    # )
+    optimizer = model.optimizer(
+        (args.learning_rate, args.learning_rate, args.learning_rate))
     if args.model and os.path.isfile(args.model):
         # weights = torch.load(args.weights)
         # model.load_state_dict(weights)
         # load_checkpoint(args.weights, model)
         # model.fc3 = nn.Sequential(nn.Linear(4096, 37))
         model, optimizer = fine_tune_model(
-            args.model, num_class_names, args.feeze_feature_layers)
+            args.model, num_class_names, args.learning_rate,
+            args.feeze_feature_layers)
 
     model = model.to(device)
-    summary(model, input_shape=(args.batch_size, 3, 96, 128))
+    summary(model, input_data=torch.randn(args.batch_size, 3, 96, 128))
 
     # Define loss function and optimizer
     criterion = nn.CrossEntropyLoss()
@@ -640,7 +721,7 @@ def model_train(args):
                 f'Train Loss: {train_loss:.8f},'
                 f'Train Acc: {train_acc.item():.2f}%')
             print(f'Val Loss: {val_loss:.8f}, Val Acc: {val_acc.item():.2f}%')
-            print(f'Best Val Acc: {best_acc.item():.2f}%')
+            print(f'* Best Val Acc: \033[92m{best_acc.item():.2f}%\033[0m')
             print('-' * 80)
         except KeyboardInterrupt:
             print("Training process is canceled by user.")
@@ -688,7 +769,7 @@ def model_train(args):
         print("Done!")
 
         # Print classification report
-        classes = np.unique(targets)
+        classes = np.unique(np.concatenate((targets, predictions)))
         classes = [class_names[i] for i in classes]
         report = classification_report(
             targets, predictions, target_names=classes, zero_division=0)
@@ -708,7 +789,7 @@ def main():
         description='License Plate Digit Classification with AlexNet')
 
     # Dataset parameters
-    parser.add_argument('-d', '--data-dir', type=str, required=True,
+    parser.add_argument('-d', '--data-dir', type=str,
                         help='data directory (default: ./license_plate_digits)')
 
     # Model parameters
@@ -736,7 +817,7 @@ def main():
                         help='Path to latest checkpoint (default: none)')
     parser.add_argument(
         '-ckpt', '--checkpoint-dir', default='./checkpoints', type=str,
-        help='checkpoint directory (default: ./license_plate_checkpoints)')
+        help='checkpoint directory (default: ./checkpoints)')
 
     # Misc parameters
     parser.add_argument('--seed', default=781227, type=int,
