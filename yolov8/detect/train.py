@@ -762,7 +762,6 @@ class Dataset(data.Dataset):
 
         # Read labels
         samples = self.load_label(images_dir)
-        print(samples)
         self.labels = list(samples.values())
         self.filenames = list(samples.keys())  # update
         self.n = len(self.filenames)  # number of samples
@@ -847,7 +846,7 @@ class Dataset(data.Dataset):
         h, w = image.shape[:2]
         r = self.input_size / max(h, w)
         if r != 1:
-            interp = resample() if self.augment else cv2.INTER_LINEAR
+            interp = resample() if self.augment else cv.INTER_LINEAR
             image = cv.resize(
                 image, dsize=(int(w * r), int(h * r)),
                 interpolation=interp)
@@ -1065,10 +1064,33 @@ def dataset_prepare(args):
     test_dataset = Dataset(
         test_dir, input_size=640, params=params, augment=False)
 
+    # Create data loaders
+    train_loader = data.DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=args.pin_memory,
+        collate_fn=Dataset.collate_fn
+    )
+    val_loader = data.DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=args.pin_memory,
+        collate_fn=Dataset.collate_fn
+    )
+    test_loader = data.DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=args.pin_memory,
+        collate_fn=Dataset.collate_fn
+    )
+    return train_loader, val_loader, test_loader
+
 
 def model_train(args):
     """Main function to train model"""
     dataloaders = dataset_prepare(args)
+    train_loader, val_loader, test_loader = dataloaders
+    for images, labels in train_loader:
+        print(images.shape)
+        print(labels)
+        break
 
 
 def main():
@@ -1078,6 +1100,13 @@ def main():
                         help="The path to the YAML file of the dataset.")
     parser.add_argument('-c', '--config', type=FileType('r'),
                         help="The path to the YAML file of training config.")
+
+    parser.add_argument('-b', '--batch-size', type=int, default=1,
+                        help="The batch size, default set to 1.")
+    parser.add_argument('--num-workers', type=int, default=2,
+                        help="The number of workers. Default set to 2.")
+    parser.add_argument('--pin-memory', action="store_true",
+                        help="Enable pin memory.")
     args = parser.parse_args()
     model_train(args)
 
