@@ -1492,7 +1492,6 @@ def validation(model, val_loader, criterion, device):
     model.eval()
     with torch.no_grad():
         for idx, (images, targets) in enumerate(iterator):
-            iterator.set_description("Training")
             images = images.to(device)  # noqa
             targets['idx'] = targets['idx'].to(device)
             targets['box'] = targets['box'].to(device)

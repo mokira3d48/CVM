@@ -3,6 +3,7 @@ numpy
 matplotlib
 scikit-learn
 Pillow
+opencv-python
 
 tqdm
 torch
