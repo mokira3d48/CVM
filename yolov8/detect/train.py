@@ -7,6 +7,7 @@ import os
 import math
 import random
 import logging
+from os.path import devnull
 from time import time
 from argparse import ArgumentParser, FileType
 from dataclasses import dataclass
@@ -15,12 +16,15 @@ import yaml
 import numpy as np
 from PIL import Image
 import cv2 as cv
+from tqdm import tqdm
 
 import torch
 import torchvision
 import torch.nn.functional as F
 from torch import nn
+from torch import optim
 from torch.utils import data
+from torchinfo import summary
 
 # Set up logging
 logging.basicConfig(
@@ -477,16 +481,18 @@ class Head(nn.Module):
         a = anchors.unsqueeze(0) - a
         b = anchors.unsqueeze(0) + b
         box = torch.cat(tensors=((a + b) / 2, b - a), dim=1)
-        return torch.cat(tensors=(box * strides, cls.sigmoid()), dim=1)
+        out = torch.cat(tensors=(box * strides, cls.sigmoid()), dim=1)
+        logger.info("--------> " + str(out.shape))
+        return out
 
 
 class YOLOv8(nn.Module):
 
-    def __init__(self, version):
+    def __init__(self, version, in_channels=3, num_classes=80):
         super().__init__()
-        self.backbone = Backbone(version=version)
+        self.backbone = Backbone(version=version, in_channels=in_channels)
         self.neck = Neck(version=version)
-        self.head = Head(version=version)
+        self.head = Head(version=version, num_classes=num_classes)
 
     def forward(self, x):
         x = self.backbone(x)              # return out1, out2, out3
@@ -575,9 +581,9 @@ def xy2wh(x, w, h):
     return y
 
 
-################################################################################
+###############################################################################
 # DATASET
-################################################################################
+###############################################################################
 
 FORMATS = 'bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp'
 
@@ -836,7 +842,8 @@ class Dataset(data.Dataset):
 
         # Convert HWC to CHW, BGR to RGB
         sample = image.transpose((2, 0, 1))[::-1]
-        sample = np.ascontiguousarray(sample)
+        sample = np.ascontiguousarray(sample, dtype=np.float32)
+        sample = sample / 255.0
 
         return (
             torch.from_numpy(sample), target_cls, target_box, torch.zeros(nl))
@@ -1010,27 +1017,28 @@ class Dataset(data.Dataset):
 # TRAINING PROCESS
 ###############################################################################
 
-@dataclass
 class Config:
-    min_lr = 0.000100000000    # initial learning rate
-    max_lr = 0.010000000000    # maximum learning rate
-    momentum = 0.9370000000    # SGD momentum/Adam beta1
-    weight_decay = 0.000500    # optimizer weight decay
-    warmup_epochs = 3.00000    # warmup epochs
-    box = 7.500000000000000    # box loss gain
-    cls = 0.500000000000000    # cls loss gain
-    dfl = 1.500000000000000    # dfl loss gain
-    hsv_h = 0.0150000000000    # image HSV-Hue augmentation (fraction)
-    hsv_s = 0.7000000000000    # image HSV-Saturation augmentation (fraction)
-    hsv_v = 0.4000000000000    # image HSV-Value augmentation (fraction)
-    degrees = 0.00000000000    # image rotation (+/- deg)
-    translate = 0.100000000    # image translation (+/- fraction)
-    scale = 0.5000000000000    # image scale (+/- gain)
-    shear = 0.0000000000000    # image shear (+/- deg)
-    flip_ud = 0.00000000000    # image flip up-down (probability)
-    flip_lr = 0.50000000000    # image flip left-right (probability)
-    mosaic = 1.000000000000    # image mosaic (probability)
-    mix_up = 0.000000000000    # image mix-up (probability)
+
+    def __init__(self):
+        self.min_lr = 0.000100000000    # initial learning rate
+        self.max_lr = 0.010000000000    # maximum learning rate
+        self.momentum = 0.9370000000    # SGD momentum/Adam beta1
+        self.weight_decay = 0.000500    # optimizer weight decay
+        self.warmup_epochs = 3.00000    # warmup epochs
+        self.box = 7.500000000000000    # box loss gain
+        self.cls = 0.500000000000000    # cls loss gain
+        self.dfl = 1.500000000000000    # dfl loss gain
+        self.hsv_h = 0.0150000000000    # image HSV-Hue augmentation (fraction)
+        self.hsv_s = 0.7000000000000    # image HSV-Saturation augmentation (fraction)
+        self.hsv_v = 0.4000000000000    # image HSV-Value augmentation (fraction)
+        self.degrees = 0.00000000000    # image rotation (+/- deg)
+        self.translate = 0.100000000    # image translation (+/- fraction)
+        self.scale = 0.5000000000000    # image scale (+/- gain)
+        self.shear = 0.0000000000000    # image shear (+/- deg)
+        self.flip_ud = 0.00000000000    # image flip up-down (probability)
+        self.flip_lr = 0.50000000000    # image flip left-right (probability)
+        self.mosaic = 1.000000000000    # image mosaic (probability)
+        self.mix_up = 0.000000000000    # image mix-up (probability)
 
     def save(self, file_path):
         data = self.__dict__
@@ -1048,7 +1056,7 @@ class AverageMeter:
         self.sum = 0
         self.avg = 0
 
-    def update(self, v, n):
+    def update(self, v, n=1):
         if not math.isnan(float(v)):
             self.num = self.num + n
             self.sum = self.sum + v * n
@@ -1063,6 +1071,7 @@ def dataset_prepare(args):
     train_dir = os.path.join(ds_root_dir, ds_config['train'])
     val_dir = os.path.join(ds_root_dir, ds_config['val'])
     test_dir = os.path.join(ds_root_dir, ds_config['test'])
+    classes = ds_config['names']
 
     config = Config()
     if args.config:
@@ -1096,7 +1105,7 @@ def dataset_prepare(args):
         num_workers=args.num_workers, pin_memory=args.pin_memory,
         collate_fn=Dataset.collate_fn
     )
-    return train_loader, val_loader, test_loader
+    return classes, (train_loader, val_loader, test_loader)
 
 
 def compute_iou(box1, box2, eps=1e-7):
@@ -1193,7 +1202,8 @@ class Assigner(torch.nn.Module):
         #: b, max_num_obj, h*w
 
         pd_boxes = pd_bboxes.unsqueeze(1)
-        pd_boxes = pd_bboxes.expand(-1, num_max_boxes, -1, -1)
+        pd_boxes = pd_boxes.expand(
+            pd_bboxes.shape[0], num_max_boxes, *pd_boxes.shape[2:])
         pd_boxes = pd_boxes[gt_mask]
 
         gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[gt_mask]
@@ -1324,6 +1334,7 @@ class BoxLoss(torch.nn.Module):
 
 
 class ComputeLoss:
+
     def __init__(self, model, params):
         if hasattr(model, 'module'):
             model = model.module
@@ -1425,14 +1436,136 @@ class ComputeLoss:
         return loss_box, loss_cls, loss_dfl
 
 
+def train_one_epoch(
+    model, train_loader, criterion, optimizer, device, gradient_accumulate=128
+):
+    losses_box = AverageMeter()
+    losses_cls = AverageMeter()
+    losses_dfl = AverageMeter()
+    gas = 0
+
+    iterator = tqdm(train_loader)
+    model.train()
+    optimizer.zero_grad()
+    num_batchs = len(train_loader)
+    for idx, (images, targets) in enumerate(iterator):
+        iterator.set_description("Training")
+        images = images.to(device)  # noqa
+        targets['idx'] = targets['idx'].to(device)
+        targets['box'] = targets['box'].to(device)
+        targets['cls'] = targets['cls'].to(device)
+
+        outputs = model.forward(images)
+        loss_box, loss_cls, loss_dfl = criterion(outputs, targets)
+        loss = loss_box + loss_cls + loss_dfl
+        loss.backward()
+
+        losses_box.update(loss_box.item())
+        losses_cls.update(loss_cls.item())
+        losses_dfl.update(loss_dfl.item())
+
+        gas += outputs[0].shape[0]
+        if gas >= gradient_accumulate or idx >= (num_batchs - 1):
+            iterator.set_description("Optimizer step")
+            optimizer.step()
+            optimizer.zero_grad()
+            gas = 0
+            iterator.write("Model parameters updated"
+                           f" - loss box: {losses_box.avg: 10.8f}"
+                           f" - loss cls: {losses_cls.avg: 10.8f}"
+                           f" - loss dfl: {losses_dfl.avg: 10.8f}")
+
+        iterator.set_postfix(
+            {'loss box': f"{losses_box.avg: 10.8f}",
+             'loss cls': f"{losses_cls.avg: 10.8f}",
+             'loss dlf': f"{losses_dfl.avg: 10.8f}"})
+
+    return losses_box.avg, losses_cls.avg, losses_dfl.avg
+
+
+def validation(model, val_loader, criterion, device):
+    losses_box = AverageMeter()
+    losses_cls = AverageMeter()
+    losses_dfl = AverageMeter()
+
+    iterator = tqdm(val_loader, desc="Validation")
+    model.eval()
+    with torch.no_grad():
+        for idx, (images, targets) in enumerate(iterator):
+            iterator.set_description("Training")
+            images = images.to(device)  # noqa
+            targets['idx'] = targets['idx'].to(device)
+            targets['box'] = targets['box'].to(device)
+            targets['cls'] = targets['cls'].to(device)
+
+            outputs = model.forward(images)
+            loss_box, loss_cls, loss_dfl = criterion(outputs, targets)
+
+            losses_box.update(loss_box.item())
+            losses_cls.update(loss_cls.item())
+            losses_dfl.update(loss_dfl.item())
+
+            iterator.set_postfix(
+                {'loss box': f"{losses_box.avg: 10.8f}",
+                 'loss cls': f"{losses_cls.avg: 10.8f}",
+                 'loss dlf': f"{losses_dfl.avg: 10.8f}"})
+
+    return losses_box.avg, losses_cls.avg, losses_dfl.avg
+
+
 def model_train(args):
     """Main function to train model"""
-    dataloaders = dataset_prepare(args)
+    config = Config()
+    if args.config:
+        config.load(args.config)
+    params = config.__dict__
+
+    setup_seed()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.device:
+        device = torch.device(args.device)
+
+    classes, dataloaders = dataset_prepare(args)
     train_loader, val_loader, test_loader = dataloaders
-    for images, labels in train_loader:
-        print(images.shape)
-        print(labels)
-        break
+
+    batch = next(iter(val_loader))
+    logger.info(f"All keys in label: {batch[1].keys()}")
+    logger.info(f"Input batch shape: {batch[0].shape}")
+    logger.info(f"Classification class: {batch[1]['cls'].shape}")
+    logger.info(f"Bounding boxes: {batch[1]['box'].shape}")
+    logger.info(f"Index identifier (with class belongs "
+                f" to which image): {batch[1]['idx']}")
+
+    model = YOLOv8(
+        version=args.model_version,
+        in_channels=args.image_channels,
+        num_classes=len(classes))
+    rand_img = torch.rand(
+        args.batch_size, args.image_channels, args.image_size, args.image_size)
+    rand_img = rand_img.to(device)
+    summary(model, input_data=rand_img)
+
+    criterion = ComputeLoss(model, params)
+    optimizer = optim.Adam(model.parameters(), lr=params['min_lr'])
+
+    train_losses = []
+    valid_losses = []
+
+    logger.info(f"Start training loop for {args.num_epochs} epochs...")
+    for epoch in range(args.num_epochs):
+        print("\n")
+        logger.info(f"Epoch: {epoch}:")
+        logger.info("Training start:")
+        losses = train_one_epoch(
+            model, train_loader, criterion, optimizer, device)
+        train_loss_box, train_loss_cls, train_loss_dfl = losses
+
+        logger.info("Validation start:")
+        losses = validation(model, val_loader, criterion, device)
+        val_loss_box, val_loss_cls, val_loss_dfl = losses
+
+        train_losses.append([train_loss_box, train_loss_cls, train_loss_dfl])
+        valid_losses.append([val_loss_box, val_loss_cls, val_loss_dfl])
 
 
 def main():
@@ -1442,6 +1575,7 @@ def main():
                         help="The path to the YAML file of the dataset.")
     parser.add_argument('-c', '--config', type=FileType('r'),
                         help="The path to the YAML file of training config.")
+    parser.add_argument('--device', type=str, help="Select a device.")
 
     parser.add_argument('-b', '--batch-size', type=int, default=1,
                         help="The batch size, default set to 1.")
@@ -1449,6 +1583,15 @@ def main():
                         help="The number of workers. Default set to 2.")
     parser.add_argument('--pin-memory', action="store_true",
                         help="Enable pin memory.")
+
+    parser.add_argument('-is', '--image-size', type=int, default=640,
+                        help="The image size. By default, it's set to 640.")
+    parser.add_argument('-ic', '--image-channels', default=3)
+    parser.add_argument('-mv', '--model-version', type=str,
+                        choices=('n', 's', 'm', 'l', 'x'), default='n')
+
+    parser.add_argument('-n', '--num-epochs', type=int, default=2,
+                        help="Number of training epochs.")
     args = parser.parse_args()
     model_train(args)
 
