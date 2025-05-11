@@ -8,7 +8,11 @@ import logging
 import argparse
 from datetime import datetime
 
+import yaml
 import numpy as np
+from PIL import Image
+import cv2 as cv
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -368,7 +372,6 @@ class ObjectDetector(nn.Module):
     """
     Object detector using ResNetFPN backbone
     """
-
     def __init__(
             self, backbone_name='resnet50', pretrained=True, num_classes=20
     ):
@@ -407,9 +410,8 @@ import torch.utils.data as data
 
 class RandomDataset(data.Dataset):
     """
-    Dataset for object detection
+    Random dataset for object detection
     """
-
     def __init__(self, images, targets, transform=None):
         self.images = images  # Shape: [N, C, H, W]
         self.targets = targets  # List of dictionaries with 'boxes' and 'labels'
@@ -427,6 +429,148 @@ class RandomDataset(data.Dataset):
 
         return image, target
 
+
+class Dataset(data.Dataset):
+    """
+    Dataset for object detection
+    """
+    def __init__(self, dataset_dir, cfg_file, img_size, transform=None):
+        self.dataset_dir = dataset_dir
+        self.cfg_file = cfg_file
+        self.img_size = img_size
+        self.transform = transform
+
+        self.img_dir = os.path.join(self.dataset_dir, "images")
+        self.lab_dir = os.path.join(self.dataset_dir, "labels")
+       # self.cfg_file = os.path.join(self.dataset_dir, "data.yaml")
+
+        self.images = os.listdir(self.img_dir)
+        self.labels = os.listdir(self.lab_dir)
+
+        self.label_names = self._load_class_names(self.cfg_file)
+
+    def _load_class_names(self, file_path):
+        """
+        Class name loading
+        ------------------
+
+        Returns the class names list contained
+        in YAML file located at file_path.
+
+        :param file_path: The file path of the YAML file.
+        :type file_path: `str`
+        :rtype: `list` of `str`
+        """
+        with open(file_path, 'r') as file:
+            content = yaml.safe_load(file)
+            if 'names' not in content:
+                raise AttributeError(
+                    "No class names list is not defined into YAML"
+                    f" file at: {file_path}")
+            names = content['names']
+            return names
+        return content
+
+    def _load_bbox(self, label_filepath):
+        """
+        Bounding box loading
+        --------------------
+
+        :type label_filepath: `str`
+        :rtype: `tuple` of `np.ndarray`
+        """
+        with open(label_filepath, mode='r') as f:
+            content_file = f.read()
+            lines = content_file.split('\n')
+            lines = [line for line in lines if line.strip()]
+            img_w = self.img_size[0]
+            img_h = self.img_size[1]
+
+            class_ids = []
+            bboxes = []
+            for line in lines:
+                try:
+                    line_split = line.split(' ')
+                    class_id = int(line_split[0])
+                    if len(line_split) != 5:
+                        continue
+                    nx = float(line_split[1])
+                    ny = float(line_split[2])
+                    nw = float(line_split[3])
+                    nh = float(line_split[4])
+                    if nx > 1 or ny > 1 or nw > 1 or nh > 1:
+                        continue
+                    class_ids.append(class_id)
+
+                    center_x = nx * img_w
+                    center_y = ny * img_h
+                    w = nw * img_w
+                    h = nh * img_h
+                    x = center_x - w / 2
+                    y = center_y - h / 2
+
+                    x1, y1 = x, y
+                    x2, y2 = x + w, y + h
+
+                    bboxes.append([x1, y1, x2, y2])
+                except ValueError as e:
+                    print(f"{e}")
+                    continue
+
+            class_ids = np.asarray(class_ids, dtype=np.float32)
+            bboxes = np.asarray(bboxes, dtype=np.float32)
+            return class_ids, bboxes
+
+    def _class_id_verify(self, class_ids):
+        """
+        Class ID verifying
+        ------------------
+
+        :type class_ids: `numpy.ndarray`
+        :rtype: `None`
+        """
+        classes_count = len(self.label_names)
+        for class_id in class_ids.tolist():
+            if not (0 <= class_id < classes_count):
+                raise ValueError(
+                    f"The class ID {class_id} is not in available classes.")
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.images[idx])
+        lab_path = os.path.join(self.lab_dir, self.labels[idx])
+
+        class_ids, bboxes = self._load_bbox(lab_path)
+        self._class_id_verify(class_ids)
+
+        # Load image
+        # Convert into RGB
+        # Resize image
+        # Normalize pixels
+        # Transpose to [C H W]
+        image = Image.open(img_path)
+        image = image.convert("RGB")
+        image = image.resize(self.img_size, Image.BILINEAR)
+        image = np.asarray(image)
+        # image = cv.resize(image, self.img_size)
+        image = image / 255.0
+        image = np.transpose(image, (2, 0, 1))
+
+        # Load annotations
+        # Albumentations augmentations
+        if self.transform:
+            augs = self.transform(image=image, bboxes=bboxes)
+            image = augs["image"]
+            bboxes = augs["bboxes"]
+
+        image = torch.tensor(image, dtype=torch.float32)
+        target = {
+            'boxes': torch.tensor(bboxes, dtype=torch.float32),
+            'labels': torch.tensor(class_ids, dtype=torch.int64)
+        }
+        return image, target
 
 def create_random_dataset(
     num_samples=10, img_size=512, num_classes=20, max_objects=10
@@ -542,8 +686,10 @@ class SmoothL1Loss(nn.Module):
             return loss
 
 
-def compute_losses(cls_outputs, reg_outputs, targets, img_size=512):
-    """Compute detection losses"""
+def compute_losses(cls_outputs, reg_outputs, targets, img_size=128):
+    """
+    Compute detection losses
+    """
     batch_size = len(targets)
     num_levels = len(cls_outputs)
 
@@ -620,8 +766,8 @@ def compute_losses(cls_outputs, reg_outputs, targets, img_size=512):
             reg_loss += reg_level_loss
 
     # Normalize losses
-    cls_loss = cls_loss / (batch_size * num_levels)
-    reg_loss = reg_loss / (batch_size * num_levels)
+    cls_loss = 100_000_000 * cls_loss / (batch_size * num_levels)
+    reg_loss = 200_000_000 * reg_loss / (batch_size * num_levels)
 
     return {
         'cls_loss': cls_loss,
@@ -631,7 +777,9 @@ def compute_losses(cls_outputs, reg_outputs, targets, img_size=512):
 
 
 def train_one_epoch(model, optimizer, data_loader, epoch, device):
-    """Train for one epoch"""
+    """
+    Train for one epoch
+    """
     model.train()
 
     total_loss = 0
@@ -662,10 +810,12 @@ def train_one_epoch(model, optimizer, data_loader, epoch, device):
 
         # Print progress
         if steps % 10 == 0:
-            print(f"Epoch: {epoch}, Step: {steps}/{len(data_loader)}, "
-                  f"Loss: {loss.item():.4f}, "
-                  f"Cls Loss: {losses['cls_loss'].item():.4f}, "
-                  f"Reg Loss: {losses['reg_loss'].item():.4f}")
+            logger.info(
+                f" Epoch: {epoch + 1},"
+                f" Step: {steps}/{len(data_loader)},"
+                f" Loss: {loss.item():.8f},"
+                f" Cls Loss: {losses['cls_loss'].item():.8f},"
+                f" Reg Loss: {losses['reg_loss'].item():.8f}")
 
     # Compute average losses
     avg_loss = total_loss / steps
@@ -719,7 +869,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename):
     torch.save(checkpoint, filename)
 
 
-def train_model(model, train_loader, val_loader, num_epochs=10, lr=0.001,
+def train_model(model, train_loader, val_loader, num_epochs=10, lr=0.0001,
                 weight_decay=0.0001,
                 patience=5, checkpoint_dir='checkpoints'):
     """Train the model"""
@@ -741,8 +891,8 @@ def train_model(model, train_loader, val_loader, num_epochs=10, lr=0.001,
     no_improve_epochs = 0
 
     for epoch in range(num_epochs):
-        print(f"\nEpoch {epoch + 1}/{num_epochs}")
-        print('-' * 20)
+        print('-' * 100)
+        logger.info(f"Epoch {epoch + 1}/{num_epochs}")
 
         # Train
         start_time = time.time()
@@ -759,16 +909,16 @@ def train_model(model, train_loader, val_loader, num_epochs=10, lr=0.001,
         scheduler.step(val_loss)
 
         # Print results
-        print(
-            f"Training loss: {train_loss:.4f}, CLS: {train_cls_loss:.4f}, REG: {train_reg_loss:.4f}")
-        print(
-            f"Validation loss: {val_loss:.4f}, CLS: {val_cls_loss:.4f}, REG: {val_reg_loss:.4f}")
-        print(
-            f"Time: {train_time:.2f}s, LR: {optimizer.param_groups[0]['lr']:.6f}")
+        logger.info(
+            f" Training loss: {train_loss:.8f}, CLS: {train_cls_loss:.8f}, REG: {train_reg_loss:.8f}")
+        logger.info(
+            f" Validation loss: {val_loss:.8f}, CLS: {val_cls_loss:.8f}, REG: {val_reg_loss:.8f}")
+        logger.info(
+            f" Time: {train_time:.2f}s, LR: {optimizer.param_groups[0]['lr']:.6f}")
 
         # Save checkpoint
         checkpoint_path = os.path.join(checkpoint_dir,
-                                       f'checkpoint_epoch_{epoch + 1}.pth')
+                                       f'checkpoint.pth')
         save_checkpoint(model, optimizer, epoch, val_loss, checkpoint_path)
 
         # Check if best model
@@ -777,13 +927,13 @@ def train_model(model, train_loader, val_loader, num_epochs=10, lr=0.001,
             no_improve_epochs = 0
             best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
             save_checkpoint(model, optimizer, epoch, val_loss, best_model_path)
-            print(f"New best model saved at {best_model_path}")
+            logger.info(f"New best model saved at {best_model_path}")
         else:
             no_improve_epochs += 1
 
         # Early stopping
         if no_improve_epochs >= patience:
-            print(
+            logger.info(
                 f"Early stopping after {patience} epochs without improvement")
             break
 
@@ -798,25 +948,28 @@ def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    print(f"Using device: {DEVICE}")
-    print(f"Creating model: {args.backbone}")
+    logger.info(f"Using device: {DEVICE}")
+    logger.info(f"Creating model: {args.backbone}")
+
+    # Create dataset
+    # print("Creating random datasets for testing...")
+    # train_images, train_targets = create_random_dataset(num_samples=50,
+    #                                                     img_size=args.img_size,
+    #                                                     num_classes=NUM_CLASSES)
+    # val_images, val_targets = create_random_dataset(num_samples=10,
+    #                                                 img_size=args.img_size,
+    #                                                 num_classes=NUM_CLASSES)
+    #
+    # train_dataset = RandomDataset(train_images, train_targets)
+    # val_dataset = RandomDataset(val_images, val_targets)
+    train_dataset = Dataset("dataset/train", "dataset/data.yaml", (128, 128))
+    val_dataset = Dataset("dataset/val", "dataset/data.yaml", (128, 128))
+    num_classes = len(train_dataset.label_names)
 
     # Create model
     model = ObjectDetector(backbone_name=args.backbone,
-                           pretrained=args.pretrained, num_classes=NUM_CLASSES)
+                           pretrained=args.pretrained, num_classes=num_classes)
     model = model.to(DEVICE)
-
-    # Create dataset
-    print("Creating random datasets for testing...")
-    train_images, train_targets = create_random_dataset(num_samples=50,
-                                                        img_size=args.img_size,
-                                                        num_classes=NUM_CLASSES)
-    val_images, val_targets = create_random_dataset(num_samples=10,
-                                                    img_size=args.img_size,
-                                                    num_classes=NUM_CLASSES)
-
-    train_dataset = RandomDataset(train_images, train_targets)
-    val_dataset = RandomDataset(val_images, val_targets)
 
     # Create data loaders
     train_loader = data.DataLoader(
@@ -830,8 +983,8 @@ def main(args):
     )
 
     # Train model
-    print("Starting training...")
-    model = train_model(
+    logger.info("Starting training...")
+    _model = train_model(
         model, train_loader, val_loader,
         num_epochs=args.epochs,
         lr=args.lr,
@@ -840,7 +993,7 @@ def main(args):
         checkpoint_dir=args.checkpoint_dir
     )
 
-    print("Done!")
+    logger.info("Done!")
 
 
 def parse_args():
@@ -858,9 +1011,9 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--num_workers', type=int, default=2,
                         help='Number of workers for data loading')
-    parser.add_argument('--epochs', type=int, default=10,
+    parser.add_argument('-n', '--epochs', type=int, default=10,
                         help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=0.001,
+    parser.add_argument('--lr', type=float, default=0.0001,
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001,
                         help='Weight decay')
@@ -959,10 +1112,6 @@ def test_training():
 
 
 if __name__ == "__main__":
-    # If no args provided, run test function
-    if not len(os.sys.argv) > 1:
-        test_training()
-    else:
-        # Parse arguments and run main
-        args = parse_args()
-        main(args)
+    # Parse arguments and run main
+    args = parse_args()
+    main(args)

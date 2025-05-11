@@ -1,17 +1,16 @@
-venv:
-	python3 -m venv env
-
 install:
-	python3 --version
-	pip install --upgrade pip
-	pip install torch torchvision --index-url "https://download.pytorch.org/whl/cpu" && \
-	pip install -r requirements.txt
+	python3 -m venv venv
+	venv/bin/python3 --version
+	venv/bin/python3 -m pip install --upgrade pip
+	venv/bin/python3 -m pip install torch torchvision --index-url "https://download.pytorch.org/whl/cpu" && \
+	venv/bin/python3 -m pip install -r requirements.txt
 
 gpu_install:
-	python3 --version
-	pip install --upgrade pip
-	pip install torch torchvision && \
-	pip install -r requirements.txt
+	python3 -m venv venv
+	venv/bin/python3 --version
+	venv/bin/python3 -m pip install --upgrade pip
+	venv/bin/python3 -m pip install torch torchvision && \
+	venv/bin/python3 -m pip install -r requirements.txt
 
 test:
 	pytest tests
