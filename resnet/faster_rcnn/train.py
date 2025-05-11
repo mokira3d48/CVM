@@ -232,6 +232,81 @@ class Model(nn.Module):
         summary(self.estimator, input_data=samples)
 
 
+class Trainer(Model):
+
+    def __init__(self, config=None):
+        super().__init__(config)
+
+        self.train_loader = None
+        self.val_loader = None
+
+        self.optimizer = None
+        self.lr_scheduler = None
+
+        self.train_losses = {}
+
+        self.gas = 128  # Gradiant Accumulation Steps
+        self.seed = 42  # Seed number for random generation
+
+
+    def compile(self, args):
+        """
+        Initialization of training process
+        ----------------------------------
+
+        :type args: `argparse.Namespace`
+        :rtype: `None`
+        """
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+
+        dataset_dir = args.dataset_dir
+        train_ds_dir = os.path.join(dataset_dir, 'train')
+        val_ds_dir = os.path.join(dataset_dir, 'val')
+        ds_config_file = os.path.join(dataset_dir, 'data.yaml')
+        if not os.path.isdir(train_ds_dir):
+            raise FileNotFoundError(
+                f"No such training set directory at {train_ds_dir}")
+        if not os.path.isdir(val_ds_dir):
+            raise FileNotFoundError(
+                f"No such validation set directory at {val_ds_dir}")
+        if not os.path.isfile(ds_config_file):
+            raise FileNotFoundError(
+                f"No such dataset config file at {ds_config_file}")
+        image_size = args.im_size
+        train_dataset = Dataset(train_ds_dir, ds_config_file, image_size)
+        val_dataset = Dataset(val_ds_dir, ds_config_file, image_size)
+
+        # Create data loaders
+        self.train_loader = data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            collate_fn=lambda x: tuple(zip(*x)))
+        self.val_loader = data.DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False,
+            collate_fn=lambda x: tuple(zip(*x)))
+
+        # Set up the optimizer
+        params = [p for p in self.estimator.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.AdamW(
+            params, lr=args.learning_rate, weight_decay=args.weight_decay)
+
+        # Learning rate scheduler
+        self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
+            self.optimizer, step_size=3, gamma=0.1)
+
+    def fit(self):
+        """
+        Training process
+        ----------------
+
+        Run the training loop and returns the results
+        formatted as dictionary.
+
+        :rtype: `dict`
+        """
+        ...
+
+
 def main():
     """
     Main function to run training proceess
@@ -241,7 +316,6 @@ def main():
 
     train_dataset = Dataset("dataset/train", "dataset/data.yaml", (128, 128))
     val_dataset = Dataset("dataset/val", "dataset/data.yaml", (128, 128))
-    num_classes = len(train_dataset.label_names)
 
     # Create data loaders
     train_loader = data.DataLoader(train_dataset, batch_size=1, shuffle=True,
