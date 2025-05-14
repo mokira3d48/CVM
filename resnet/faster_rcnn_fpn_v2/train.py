@@ -14,7 +14,7 @@ import torch
 from torch import nn
 from torch.utils import data
 
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 from torchinfo import summary
@@ -24,7 +24,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("faster_rcnn.log"),
+        logging.FileHandler("faster_rcnn_fpn_v2.log"),
         logging.StreamHandler()
     ]
 )
@@ -195,8 +195,8 @@ class Dataset(data.Dataset):
 
 
 class Model(nn.Module):
-    _default_file_name = 'faster_rcnn'
-    _backbones = {'resnet50': fasterrcnn_resnet50_fpn}
+    _default_file_name = 'faster_rcnn_fpn_v2'
+    _backbones = {'resnet50': fasterrcnn_resnet50_fpn_v2}
 
     @dataclass
     class Config:
@@ -661,7 +661,7 @@ class InferenceStorage:
     @classmethod
     def load(cls, file_path):
         data = torch.load(file_path, weights_only=False, map_location='cpu')
-        if "format" not in data or data['format'] != 'faster_rcnn':
+        if "format" not in data or data['format'] != 'faster_rcnn_fpn_v2':
             raise ValueError("Not supported formatting.")
         instance = cls(file_path)
         instance.label_predict = data['label_predict']
@@ -712,7 +712,7 @@ class InferenceStorage:
                 "label_target": self.label_target,
                 "bbox_predict": self.bbox_predict,
                 "bbox_target": self.bbox_target,
-                "format": "faster_rcnn",
+                "format": "faster_rcnn_fpn_v2",
             }
             torch.save(data, self.file_path)
 
@@ -1056,7 +1056,7 @@ def parse_argument():
     parser.add_argument('-d', '--dataset-dir', type=str, required=True)
     parser.add_argument('-b', '--batch-size', type=int, default=1)
 
-    parser.add_argument('-imsz', '--image-size', type=int, default=640)
+    parser.add_argument('-imsz', '--image-size', type=int, default=800)
     parser.add_argument(
         '--backbone', type=str, choices=['resnet50'], default='resnet50')
 
