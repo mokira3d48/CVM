@@ -157,7 +157,7 @@ class Dataset(data.Dataset):
 
     def __len__(self):
         # return len(self.images)
-        return 100
+        return 20
 
     def __getitem__(self, idx):
         img_path = os.path.join(self.img_dir, self.images[idx])
@@ -516,7 +516,6 @@ def calculate_average_precision(precision, recall):
     return average_precision
 
 
-
 class MAP:
     """
     Mean Average Precision
@@ -628,11 +627,11 @@ class MAP:
         return mapx, class_aps
 
     def update(self, predictions, targets):
-        pred_boxes_list = [predict['boxes'] for predict in predictions]
-        pred_labels_list = [predict['labels'] for predict in predictions]
-        pred_scores_list = [predict['scores'] for predict in predictions]
-        true_boxes_list = [target['boxes'] for target in targets]
-        true_labels_list = [target['labels'] for target in targets]
+        pred_boxes_list = [predict['boxes'].cpu() for predict in predictions]
+        pred_labels_list = [predict['labels'].cpu() for predict in predictions]
+        pred_scores_list = [predict['scores'].cpu() for predict in predictions]
+        true_boxes_list = [target['boxes'].cpu() for target in targets]
+        true_labels_list = [target['labels'].cpu() for target in targets]
 
         self.pred_boxes_list.extend(pred_boxes_list)
         self.pred_labels_list.extend(pred_labels_list)
@@ -776,7 +775,11 @@ class Trainer(Model):
 
         self.checkpoint_dir = "checkpoints"
         self.resume_ckpt = None
-        self.epoch = 1
+        self.best_model = None
+        self.epoch = 0
+
+        self.best_performance = {}
+        self.val_results = {}
 
     def compile(self, args):
         """
@@ -830,6 +833,7 @@ class Trainer(Model):
 
         self.resume_ckpt = args.resume
         self.checkpoint_dir = args.checkpoint_dir
+        self.best_model = args.best_model
 
         self.inference_store = InferenceStorage(args.inference_store)
         self.mAP50 = MAP(0.50, len(val_dataset.label_names) + 1)
@@ -849,12 +853,12 @@ class Trainer(Model):
                 output_losses[key] = new_loss
 
     @staticmethod
-    def _print_losses(avg_meters):
+    def print_results(res):
         """
         Function of average meter losses
         """
         string = ''
-        for key, val in avg_meters.items():
+        for key, val in res.items():
             string += f"{key}: {val:.8f} "
         return string
 
@@ -874,8 +878,9 @@ class Trainer(Model):
             "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
             "epoch": self.epoch,
             "train_losses": self.train_losses,
-            **kwargs
-        }
+            "val_results": self.val_results,
+            "best_performance": self.best_performance,
+            **kwargs}
 
         file_path1 = os.path.join(
             self.checkpoint_dir, "checkpoint.pth")
@@ -883,13 +888,14 @@ class Trainer(Model):
             self.checkpoint_dir, f"checkpoint_{self.epoch}.pth")
         torch.save(checkpoint, file_path1)
         copy(file_path1, file_path2)
-        logger.info("Checkpoint done")
+        logger.info("Checkpoint done successfully")
 
-        if self.epoch > 2:
+        if self.epoch >= 2 and (self.epoch % 2) == 0:
             old_checkpoint_file = os.path.join(
                 self.checkpoint_dir, f"checkpoint_{self.epoch - 2}.pth")
             if os.path.isfile(old_checkpoint_file):
                 os.remove(old_checkpoint_file)
+                logger.info(f"{old_checkpoint_file} checkpoint is removed.")
 
     def load_checkpoint(self):
         if not self.resume_ckpt:
@@ -902,9 +908,45 @@ class Trainer(Model):
             self.resume_ckpt, weights_only=False, map_location='cpu')
         self.optimizer.load_state_dict(ckpt_data['optimizer_state_dict'])
         self.lr_scheduler.load_state_dict(ckpt_data['lr_scheduler_state_dict'])
-        self.epoch = ckpt_data['epoch']
+        self.epoch = ckpt_data['epoch'] + 1
         self.train_losses = ckpt_data['train_losses']
+        self.val_results = ckpt_data['val_results']
+        self.best_performance = ckpt_data['best_performance']
         logger.info(f"Checkpoint loaded successfully from {self.resume_ckpt}!")
+
+    def save_best_model(self):
+        map50s = self.val_results.get('mAP50')
+        map75s = self.val_results.get('mAP75')
+        map95s = self.val_results.get('mAP95')
+
+        if not map50s:
+            return
+
+        map50 = map50s[-1]
+        map75 = map75s[-1]
+        map95 = map95s[-1]
+
+        if not self.best_performance:
+            self.best_performance = {
+                "mAP50": map50,
+                "mAP75": map75,
+                "mAP95": map95}
+
+        is_best = (
+            map50 > self.best_performance['mAP50']
+            or map75 > self.best_performance['mAP75']
+            or map95 > self.best_performance['mAP95'])
+        if not is_best:
+            return
+
+        self.save(self.best_model)
+        self.best_performance = {
+            "mAP50": map50,
+            "mAP75": map75,
+            "mAP95": map95}
+        logger.info(
+            "New performance performed"
+            f" {self.print_results(self.best_performance)}")
 
     def train_step(self, images, targets, write_fn, optimize=False):
         """
@@ -1023,9 +1065,9 @@ class Trainer(Model):
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.load_checkpoint()
 
-        for epoch in range(self.epoch, (self.num_epochs + 1)):
+        for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
-            logger.info(f'Epoch: {epoch} / {self.num_epochs}')
+            logger.info(f'Epoch: {epoch + 1} / {self.num_epochs}:\n')
 
             train_losses = self.train_one_epoch()
 
@@ -1033,16 +1075,20 @@ class Trainer(Model):
             self.lr_scheduler.step()
 
             # Add losses to train losses epochs
+            # Save checkpoint with the current model state
             self._add_to_epoch_results(self.train_losses, train_losses)
+            logger.info(f'{self.print_results(train_losses)}')
+            self.checkpoint()
 
-            logger.info(f'{self._print_losses(train_losses)}')
-
-            val_losses = self.validate()
+            results = self.validate()
+            self._add_to_epoch_results(self.val_results, results)
+            logger.info(f'{self.print_results(results)}')
             # self.inference_store.save()
 
-            self.checkpoint(train_losses=train_losses)
+            self.checkpoint()
+            self.save_best_model()
 
-            if epoch != self.num_epochs:
+            if epoch != (self.num_epochs - 1):
                 # Epochs are remaining
                 logger.info("-" * 80)
 
@@ -1069,6 +1115,7 @@ def parse_argument():
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
     parser.add_argument('-m', '--model-file', type=str)
     parser.add_argument('--inference-store', type=str, default="store.pth")
+    parser.add_argument('--best-model', type=str, default="best")
 
     args = parser.parse_args()
     logger.info("Training arguments:")
@@ -1114,4 +1161,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+        exit(0)
+    except KeyboardInterrupt:
+        print("\033[91mCanceled by user!\033[0m")
+        exit(125)
