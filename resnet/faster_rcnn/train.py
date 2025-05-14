@@ -3,6 +3,7 @@ import logging
 from dataclasses import dataclass
 from argparse import ArgumentParser
 from shutil import copy
+from collections import defaultdict
 
 import yaml
 import numpy as np
@@ -155,8 +156,8 @@ class Dataset(data.Dataset):
                     f"The class ID {class_id} is not in available classes.")
 
     def __len__(self):
-        # return len(self.images)
-        return 10
+        return len(self.images)
+        # return 10
 
     def __getitem__(self, idx):
         img_path = os.path.join(self.img_dir, self.images[idx])
@@ -187,44 +188,10 @@ class Dataset(data.Dataset):
 
         image = torch.tensor(image, dtype=torch.float32)
         target = {
+            'labels': torch.tensor(class_ids, dtype=torch.int64),
             'boxes': torch.tensor(bboxes, dtype=torch.float32),
-            'labels': torch.tensor(class_ids, dtype=torch.int64)
         }
         return image, target
-
-
-class AvgMeter:
-
-    def __init__(self, val=0):
-        self.total = val
-        self.count = 0
-
-    def reset(self):
-        self.total = 0.0
-        self.count = 0
-
-    def __add__(self, other):
-        """
-        Add function
-
-        :type other: `float`|`int`
-        """
-        self.total += other
-        self.count += 1
-        return self
-
-    def __radd__(self, other):
-        return self.__add__(other)
-
-    def avg(self):
-        if self.count > 0:
-            return self.total / self.count
-        else:
-            return 0.0
-
-    def __str__(self):
-        return str(self.total)
-
 
 
 class Model(nn.Module):
@@ -286,7 +253,7 @@ class Model(nn.Module):
         # Replace the head of the model with a new one
         # (for the number of classes in your dataset)
         self.estimator.roi_heads.box_predictor = \
-            FastRCNNPredictor(in_feat, self.config.num_classes)
+            FastRCNNPredictor(in_feat, self.config.num_classes + 1)
 
     def forward(self, inputs, target=None):
         """
@@ -327,6 +294,386 @@ class Model(nn.Module):
         self.config.save(param_file)
 
 
+class AvgMeter:
+
+    def __init__(self, val=0):
+        self.total = val
+        self.count = 0
+
+    def reset(self):
+        self.total = 0.0
+        self.count = 0
+
+    def __add__(self, other):
+        """
+        Add function
+
+        :type other: `float`|`int`
+        """
+        self.total += other
+        self.count += 1
+        return self
+
+    def __radd__(self, other):
+        return self.__add__(other)
+
+    def avg(self):
+        if self.count > 0:
+            return self.total / self.count
+        else:
+            return 0.0
+
+    def __str__(self):
+        return str(self.total)
+
+
+def calculate_iou(box1, box2):
+    """
+    Calculate Intersection over Union  (IoU) between two bounding boxes
+
+    :param box1: Tensor of shape (4,) with [x1, y1, x2, y2] coordinates
+    :param box2: Tensor of shape (4,) with [x1, y1, x2, y2] coordinates
+
+    :type box1: `torch.Tensor`
+    :type box2: `torch.Tensor`
+
+    :returns: IoU value as a scalar tensor
+    :rtype: `torch.Tensor`
+    """
+    # Get the coordinates of the intersection rectangle
+    x1 = torch.max(box1[0], box2[0])
+    y1 = torch.max(box1[1], box2[1])
+    x2 = torch.min(box1[2], box2[2])
+    y2 = torch.min(box1[3], box2[3])
+
+    # Calculate area of intersection rectangle
+    inter_area = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+
+    # Calculate area of both bounding boxes
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+    # Calculate Union area by using Formula: Union = A + B - Intersection
+    union_area = box1_area + box2_area - inter_area
+
+    # Compute IoU
+    iou = inter_area / union_area
+
+    return iou
+
+
+def calculate_precision_recall(
+    pred_boxes,
+    pred_labels,
+    pred_scores,
+    true_boxes,
+    true_labels,
+    iou_threshold,
+    num_classes=None
+):
+    """
+    Calculate precision and recall values for each class
+
+    Args:
+        pred_boxes (torch.Tensor): Tensor of shape (N, 4) with predicted
+            bounding boxes [x1, y1, x2, y2]
+        pred_labels: Tensor of shape (N,) with predicted class labels
+        pred_scores: Tensor of shape (N,) with confidence scores
+            for predictions
+        true_boxes: Tensor of shape (M, 4) with ground truth bounding boxes
+            [x1, y1, x2, y2]
+        true_labels: Tensor of shape (M,) with ground truth class labels
+        iou_threshold: IoU threshold to determine if detection is correct
+        num_classes: Number of classes in the dataset
+
+    Returns:
+        precision_dict: Dictionary mapping class_id to list of precision values
+        recall_dict: Dictionary mapping class_id to list of recall values
+        gt_count_dict: Dictionary mapping class_id to number
+            of ground truth instances
+    """
+    if num_classes is None:
+        num_classes = max(torch.max(pred_labels).item(),
+                          torch.max(true_labels).item()) + 1
+
+    # Sort predictions by decreasing confidence
+    indices = torch.argsort(pred_scores, descending=True)
+    pred_boxes = pred_boxes[indices]
+    pred_labels = pred_labels[indices]
+    pred_scores = pred_scores[indices]
+
+    # Initialize dictionaries to store precision-recall values for each class
+    precision_dict = defaultdict(list)
+    recall_dict = defaultdict(list)
+    gt_count_dict = defaultdict(int)
+
+    # Count ground truth instances per class
+    for label in true_labels:
+        gt_count_dict[label.item()] += 1
+
+    # Initialize detection status for ground truth boxes
+    detection_status = torch.zeros(len(true_boxes), dtype=torch.bool)
+
+    # Initialize counter for true positives per class
+    true_positives_per_class = defaultdict(int)
+
+    # Evaluate each prediction
+    cumulative_tps = defaultdict(list)
+    cumulative_fps = defaultdict(list)
+
+    for i, (box, label, score) in enumerate(
+            zip(pred_boxes, pred_labels, pred_scores)):
+        matched_gt = -1
+        max_iou = iou_threshold
+
+        # Find the ground truth box with the highest IoU
+        for j, (gt_box, gt_label) in enumerate(zip(true_boxes, true_labels)):
+            # Only compare boxes of the same class
+            if label == gt_label and not detection_status[j]:
+                iou = calculate_iou(box, gt_box)
+                if iou > max_iou:
+                    max_iou = iou
+                    matched_gt = j
+
+        # Update statistics for the current class
+        class_id = label.item()
+
+        # If match found, count it as true positive
+        if matched_gt >= 0:
+            detection_status[matched_gt] = True
+            true_positives_per_class[class_id] += 1
+
+        # Count cumulative true positives and false positives
+        cumulative_tps[class_id].append(true_positives_per_class[class_id])
+        cumulative_fps[class_id].append(
+            i + 1 - true_positives_per_class[class_id])
+
+    # Calculate precision and recall for each class
+    for class_id in range(num_classes):
+        if class_id not in gt_count_dict:
+            gt_count_dict[class_id] = 0
+
+        if class_id not in cumulative_tps:
+            precision_dict[class_id] = [1.0]  # No detections = 100% precision
+            recall_dict[class_id] = [0.0]  # No detections = 0% recall
+            continue
+
+        # Convert cumulative TP and FP to precision and recall values
+        tp_array = cumulative_tps[class_id]
+        fp_array = cumulative_fps[class_id]
+
+        if gt_count_dict[class_id] > 0:
+            recalls = [tp / gt_count_dict[class_id] for tp in tp_array]
+            precisions = [tp / (tp + fp) for tp, fp in zip(tp_array, fp_array)]
+        else:
+            recalls = [0.0] * len(tp_array)
+            precisions = [0.0] * len(tp_array)
+
+        # Add point at (0, 1) to make the PR curve start from precision=1
+        precision_dict[class_id] = [1.0] + precisions
+        recall_dict[class_id] = [0.0] + recalls
+
+    return precision_dict, recall_dict, gt_count_dict
+
+
+def calculate_average_precision(precision, recall):
+    """
+    Calculate Average Precision using the 11-point interpolation
+    (or use the area under the PR curve directly)
+
+    Args:
+        precision (typing.List[float]): List of precision values
+        recall (typing.List[float]): List of recall values
+
+    Returns:
+        float: Average Precision value
+    """
+    # Make sure precision and recall are paired correctly
+    assert len(precision) == len(recall), (
+        "Precision and recall lists must have the same length")
+
+    # Ensure precision and recall are in the correct order (sorted by recall)
+    if len(recall) > 1 and recall[0] > recall[1]:
+        sorted_pairs = sorted(zip(recall, precision))
+        recall = [r for r, _ in sorted_pairs]
+        precision = [p for _, p in sorted_pairs]
+
+    # Calculate area under PR curve using all points
+    average_precision = 0
+    for i in range(len(recall) - 1):
+        average_precision += (recall[i + 1] - recall[i]) * precision[i + 1]
+
+    return average_precision
+
+
+def calculate_map50(
+    pred_boxes_list, pred_labels_list, pred_scores_list,
+    true_boxes_list, true_labels_list, num_classes: int = None
+):
+    """
+    Calculate mAP50 across all classes and images
+
+    Args:
+        pred_boxes_list (typing.List[torch.Tensor]): List of tensors
+            with predicted bounding boxes [x1, y1, x2, y2] for each image
+        pred_labels_list (typing.List[torch.Tensor]): List of tensors
+            with predicted class labels for each image
+        pred_scores_list (typing.List[torch.Tensor]): List of tensors
+            with confidence scores for predictions for each image
+        true_boxes_list (typing.List[torch.Tensor]): List of tensors
+            with ground truth bounding boxes [x1, y1, x2, y2] for each image
+        true_labels_list (typing.List[torch.Tensor]): List of tensors
+            with ground truth class labels for each image
+        num_classes: Number of classes in the dataset
+
+    Returns:
+        float: mAP50 Mean Average Precision at IoU threshold of 0.5
+        typing.Dict[int, float]: class_aps Dictionary mapping class_id
+            to AP value
+    """
+    # Determine the number of classes if not provided
+    if num_classes is None:
+        max_pred_class = max(
+            [torch.max(labels).item() if len(labels) > 0 else -1
+             for labels in pred_labels_list])
+        max_true_class = max(
+            [torch.max(labels).item() if len(labels) > 0 else -1
+             for labels in true_labels_list])
+        num_classes = max(max_pred_class, max_true_class) + 1
+
+    # Aggregate precision and recall dictionaries across all images
+    all_precisions = defaultdict(list)
+    all_recalls = defaultdict(list)
+    gt_counts = defaultdict(int)
+
+    # Process each image
+    for pred_boxes, pred_labels, pred_scores, true_boxes, true_labels in zip(
+            pred_boxes_list, pred_labels_list, pred_scores_list,
+            true_boxes_list, true_labels_list
+    ):
+        # Skip if there are no predictions or ground truth
+        if len(pred_boxes) == 0 or len(true_boxes) == 0:
+            continue
+
+        # Calculate precision and recall for this image
+        precision_dict, recall_dict, gt_count_dict = calculate_precision_recall(
+            pred_boxes, pred_labels, pred_scores,
+            true_boxes, true_labels,
+            iou_threshold=0.5,
+            num_classes=num_classes
+        )
+
+        # Update global dictionaries
+        for class_id in range(num_classes):
+            if class_id in precision_dict:
+                all_precisions[class_id].extend(precision_dict[class_id])
+                all_recalls[class_id].extend(recall_dict[class_id])
+            gt_counts[class_id] += gt_count_dict[class_id]
+
+    # Calculate AP for each class
+    class_aps = {}
+    valid_classes = 0
+    sum_ap = 0.0
+
+    for class_id in range(num_classes):
+        # Skip classes with no ground truth instances
+        if gt_counts[class_id] == 0:
+            class_aps[class_id] = 0.0
+            continue
+
+        # Sort precision and recall values by recall
+        if len(all_recalls[class_id]) > 0:
+            paired = sorted(
+                zip(all_recalls[class_id], all_precisions[class_id]))
+            recalls_sorted = [r for r, _ in paired]
+            precisions_sorted = [p for _, p in paired]
+
+            # Calculate AP for this class
+            ap = calculate_average_precision(precisions_sorted, recalls_sorted)
+            class_aps[class_id] = ap
+            sum_ap += ap
+            valid_classes += 1
+        else:
+            class_aps[class_id] = 0.0
+
+    # Calculate mAP50
+    map50 = sum_ap / valid_classes if valid_classes > 0 else 0.0
+
+    return map50, class_aps
+
+
+class mAP50:
+    def __init__(self):
+        ...
+
+
+class InferenceStorage:
+
+    @classmethod
+    def load(cls, file_path):
+        data = torch.load(file_path, weights_only=False, map_location='cpu')
+        if "format" not in data or data['format'] != 'faster_rcnn':
+            raise ValueError("Not supported formatting.")
+        instance = cls(file_path)
+        instance.label_predict = data['label_predict']
+        instance.label_target = data['label_target']
+        instance.bbox_predict = data['bbox_predict']
+        instance.bbox_target = data['bbox_target']
+
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.label_predict = None
+        self.label_target = None
+        self.bbox_predict = None
+        self.bbox_target = None
+
+    def _add_inf(self, label_predict, label_target, bbox_predict, bbox_target):
+        """
+        Adding function
+        ---------------
+
+        """
+        if self.label_predict is not None:
+            self.label_predict = torch.cat([self.label_predict, label_predict])
+            self.label_target = torch.cat([self.label_target, label_target])
+            self.bbox_predict = torch.cat([self.bbox_predict, bbox_predict])
+            self.bbox_target = torch.cat([self.bbox_target, bbox_target])
+        else:
+            self.label_predict = label_predict
+            self.label_target = label_target
+            self.bbox_predict = bbox_predict
+            self.bbox_target = bbox_target
+
+    def add(self, predictions, targets):
+        batch_size = len(predictions)
+        for b in range(batch_size):
+            self._add_inf(
+                predictions[b]['labels'], targets[b]['labels'],
+                predictions[b]['boxes'], targets[b]['boxes'])
+
+    def save(self):
+        """
+        Saving function
+        ---------------
+
+        """
+        if self.label_predict is not None:
+            data = {
+                "label_predict": self.label_predict,
+                "label_target": self.label_target,
+                "bbox_predict": self.bbox_predict,
+                "bbox_target": self.bbox_target,
+                "format": "faster_rcnn",
+            }
+            torch.save(data, self.file_path)
+
+    def clear(self):
+        self.label_predict = None
+        self.label_target = None
+        self.bbox_predict = None
+        self.bbox_target = None
+
+
 class Trainer(Model):
     """
     Training model
@@ -360,7 +707,12 @@ class Trainer(Model):
         self.lr_scheduler = None
 
         self.train_losses = {}
-        self.val_losses = {}
+        self.loss_classifier = AvgMeter()
+        self.loss_box_reg = AvgMeter()
+        self.loss_objectness = AvgMeter()
+        self.loss_rpn_box_reg = AvgMeter()
+
+        self.inference_store = None
 
         self.gas = 128  # Gradiant Accumulation Steps
         self.seed = 42  # Seed number for random generation
@@ -426,6 +778,8 @@ class Trainer(Model):
         self.resume_ckpt = args.resume
         self.checkpoint_dir = args.checkpoint_dir
 
+        self.inference_store = InferenceStorage(args.inference_store)
+
     @staticmethod
     def _update_losses(input_losses, output_losses):
         """
@@ -439,22 +793,22 @@ class Trainer(Model):
                 output_losses[key] = new_loss
 
     @staticmethod
-    def _print_avg_meter_losses(avg_meters):
+    def _print_losses(avg_meters):
         """
         Function of average meter losses
         """
         string = ''
         for key, val in avg_meters.items():
-            string += f"{key}: {val.avg():.8f} "
+            string += f"{key}: {val:.8f} "
         return string
 
     @staticmethod
     def _add_to_epoch_results(epc_res, new_res):
         for key, val in epc_res.items():
             if key in epc_res:
-                epc_res[key].append(new_res[key].avg())
+                epc_res[key].append(new_res[key])
             else:
-                epc_res[key] = [new_res[key].avg()]
+                epc_res[key] = [new_res[key]]
 
     def checkpoint(self, **kwargs):
         checkpoint = {
@@ -495,14 +849,11 @@ class Trainer(Model):
         self.train_losses = ckpt_data['train_losses']
         logger.info(f"Checkpoint loaded successfully from {self.resume_ckpt}!")
 
-    def train_step(self, images, targets):
+    def train_step(self, images, targets, write_fn, optimize=False):
         """
         Training method on one batch
         """
-        # Zero the gradients
-        self.optimizer.zero_grad()
-
-        # Forward pass
+        # Forward pass and loss compute
         loss_dict = self.forward(images, targets)
         losses = list(loss_dict.values())
         loss = losses[0]
@@ -512,49 +863,76 @@ class Trainer(Model):
         # Backward pass
         loss.backward()
 
+        self.loss_classifier += loss_dict['loss_classifier'].item()
+        self.loss_box_reg += loss_dict['loss_box_reg'].item()
+        self.loss_objectness += loss_dict['loss_objectness'].item()
+        self.loss_rpn_box_reg += loss_dict['loss_rpn_box_reg'].item()
+
         self.gac += len(images)
-        self.optimizer.step()
-        return {key: value.item()
-                for key, value in loss_dict.items()}
+        if self.gac >= self.gas or optimize:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+            write_fn(
+                "Optim step"
+                f" - loss classifier: {self.loss_classifier.avg():.8f}"
+                f" - loss box reg: {self.loss_box_reg.avg():.8f}"
+                f" - loss objectness: {self.loss_objectness.avg():.8f}"
+                f" - loss rpn box reg: {self.loss_rpn_box_reg.avg():.8f}")
+            self.gac = 0
 
     def train_one_epoch(self):
         """
         Method of training on one epoch
         """
         device = self.device()
-        train_losses = {}
+        loss_data = {}
+
+        length = len(self.train_loader)
+        iterator = tqdm(self.train_loader, desc="train")
+        write_fn = iterator.write
 
         self.train()
-        iterator = tqdm(self.train_loader, desc="train")
+        self.optimizer.zero_grad()
         for index, (images, targets) in enumerate(iterator):
-            images = list(image.to(device) for image in images)
+            images = list(image.to(device) for image in images)  # noqa
             targets = [
                 {k: v.to(device) for k, v in t.items()} for t in targets]
 
-            losses = self.train_step(images, targets)
-            iterator.set_postfix(losses)
+            # At last iteration, the gradient accumulation count can not
+            # be equal to gradient accumulation step, so we must perform
+            # optimization step when we are at the last iteration (length - 1)
+            last_index = index >= (length - 1)
+            self.train_step(images, targets, write_fn, last_index)
 
-            self._update_losses(losses, train_losses)
+            loss_data = {
+                "loss_classifier": self.loss_classifier.avg(),
+                "loss_box_reg": self.loss_box_reg.avg(),
+                "loss_objectness": self.loss_objectness.avg(),
+                "loss_rpn_box_reg": self.loss_rpn_box_reg.avg()}
+            iterator.set_postfix(loss_data)
 
-        return train_losses
+        return loss_data
 
     def validate(self):
         device = self.device()
         self.eval()
         with torch.no_grad():
             iterator = tqdm(self.val_loader, desc="val")
-            boxes_predictions = []
-            labels_predictions = []
+            # boxes_predictions = []
+            # labels_predictions = []
 
-            for images, _ in iterator:
+            for images, targets in iterator:
                 images = list(img.to(device) for img in images)
 
                 # Forward pass
                 predictions = self.forward(images)
                 # iterator.write(str(predictions))
 
-                boxes_predictions.append(predictions[0]['boxes'])
-                labels_predictions.append(predictions[0]['labels'])
+                self.inference_store.add(predictions, targets)
+
+                # boxes_predictions.append(predictions[0]['boxes'])
+                # labels_predictions.append(predictions[0]['labels'])
 
     def fit(self):
         """
@@ -581,115 +959,16 @@ class Trainer(Model):
             # Add losses to train losses epochs
             self._add_to_epoch_results(self.train_losses, train_losses)
 
-            logger.info(f'{self._print_avg_meter_losses(train_losses)}')
+            logger.info(f'{self._print_losses(train_losses)}')
 
             val_losses = self.validate()
+            self.inference_store.save()
 
             self.checkpoint(train_losses=train_losses)
 
-            logger.info("-" * 80)
-
-def main_():
-    """
-    Main function to run training process
-    """
-    torch.manual_seed(42)
-    np.random.seed(42)
-
-    train_dataset = Dataset("dataset/train", "dataset/data.yaml", (128, 128))
-    val_dataset = Dataset("dataset/val", "dataset/data.yaml", (128, 128))
-
-    # Create data loaders
-    train_loader = data.DataLoader(train_dataset, batch_size=1, shuffle=True,
-                                   collate_fn=(lambda x: tuple(zip(*x))))
-    valid_loader = data.DataLoader(val_dataset, batch_size=1, shuffle=False,
-                                   collate_fn=(lambda x: tuple(zip(*x))))
-
-    config = Model.Config()
-    config.class_names = train_dataset.label_names
-    config.im_size = 128
-    model = Model(config)
-
-    # Move model to GPU if available
-    device = torch.device('cuda') if torch.cuda.is_available() \
-             else torch.device('cpu')
-    model.to(device)
-    model.summary()
-
-    # Set up the optimizer
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(
-        params, lr=0.005, momentum=0.9, weight_decay=0.0005)
-
-    # Learning rate scheduler
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=3, gamma=0.1)
-
-    # Train the model
-    num_epochs = 10
-    for epoch in range(num_epochs):
-        model.train()
-        train_loss = 0.0
-        iterator = tqdm(train_loader, desc="train")
-
-        # Training loop
-        for index, (images, targets) in enumerate(iterator):
-            images = list(image.to(device) for image in images)
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-            # Zero the gradients
-            optimizer.zero_grad()
-
-            # Forward pass
-            loss_dict = model(images, targets)
-            losses = list(loss_dict.values())
-            loss = losses[0]
-            for i in range(1, len(losses)):
-                loss += losses[i]
-
-            # print("loss:", loss)
-
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-            iterator.set_postfix(
-                {name:value.item() for name, value in loss_dict.items()})
-
-        # Update the learning rate
-        lr_scheduler.step()
-        print(
-            f'Epoch: {epoch + 1}, Train Loss: {train_loss / len(train_loader)}')
-
-        # Test on a new image
-        model.eval()
-        with torch.no_grad():
-            iterator = tqdm(valid_loader, desc="val")
-            val_loss = 0
-            for images, targets in iterator:
-                images = list(img.to(device) for img in images)
-
-                # Forward pass
-                loss_dict = model(images, targets)
-                # iterator.write(str(loss_dict))
-                # losses = list(loss_dict.values())
-                # loss = losses[0]
-                # for i in range(1, len(losses)):
-                #     loss += losses[i]
-                # val_loss += loss.item()
-                #
-                # iterator.set_postfix(
-                #     {name: value.item() for name, value in loss_dict.items()})
-
-                # Example: print the bounding boxes and labels
-                # for the first image
-                # print(predictions[0]['boxes'])
-                # print(predictions[0]['labels'])
-            print(
-                f'Epoch: {epoch + 1}, Val Loss: {val_loss / len(valid_loader)}')
-
-        torch.save(model.state_dict(), 'frcnn_numpr.pth')
-    print("Training complete!")
+            if epoch != self.num_epochs:
+                # Epochs are remaining
+                logger.info("-" * 80)
 
 
 def parse_argument():
@@ -713,6 +992,7 @@ def parse_argument():
     parser.add_argument('-r', "--resume", type=str)
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
     parser.add_argument('-m', '--model-file', type=str)
+    parser.add_argument('--inference-store', type=str, default="store.pth")
 
     args = parser.parse_args()
     logger.info("Training arguments:")
