@@ -764,6 +764,7 @@ class Trainer(Model):
 
         self.inference_store = None
         self.mAP50 = None
+        self.mAP75 = None
         self.mAP95 = None
 
         self.gas = 128  # Gradiant Accumulation Steps
@@ -832,6 +833,7 @@ class Trainer(Model):
 
         self.inference_store = InferenceStorage(args.inference_store)
         self.mAP50 = MAP(0.50, len(val_dataset.label_names) + 1)
+        self.mAP75 = MAP(0.75, len(val_dataset.label_names) + 1)
         self.mAP95 = MAP(0.95, len(val_dataset.label_names) + 1)
 
     @staticmethod
@@ -990,13 +992,17 @@ class Trainer(Model):
                 predictions = self.forward(images)
                 # iterator.write(str(predictions))
 
-                self.inference_store.add(predictions, targets)
+                # self.inference_store.add(predictions, targets)
                 self.mAP50.update(predictions, targets)
+                self.mAP75.update(predictions, targets)
                 self.mAP95.update(predictions, targets)
 
-                mAP50, _ = self.mAP50()
-                mAP95, _ = self.mAP95()
-                metrics = {"mAP50": mAP50, "mAP95": mAP95}
+                map50, _ = self.mAP50()
+                map75, _ = self.mAP75()
+                map95, _ = self.mAP95()
+                metrics = {"mAP50": map50,
+                           "mAP75": map75,
+                           "mAP95": map95}
                 iterator.set_postfix(metrics)
 
                 # boxes_predictions.append(predictions[0]['boxes'])
@@ -1032,7 +1038,7 @@ class Trainer(Model):
             logger.info(f'{self._print_losses(train_losses)}')
 
             val_losses = self.validate()
-            self.inference_store.save()
+            # self.inference_store.save()
 
             self.checkpoint(train_losses=train_losses)
 
