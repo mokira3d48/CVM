@@ -156,8 +156,8 @@ class Dataset(data.Dataset):
                     f"The class ID {class_id} is not in available classes.")
 
     def __len__(self):
-        return len(self.images)
-        # return 10
+        # return len(self.images)
+        return 100
 
     def __getitem__(self, idx):
         img_path = os.path.join(self.img_dir, self.images[idx])
@@ -230,7 +230,7 @@ class Model(nn.Module):
         instance = cls(hparams)
         weights = torch.load(
             model_file, weights_only=True, map_location='cpu')
-        instance.load_state_dict(weights)
+        instance.estimator.load_state_dict(weights)
         logger.info("Model weights loaded successfully!")
         return instance
 
@@ -255,6 +255,13 @@ class Model(nn.Module):
         self.estimator.roi_heads.box_predictor = \
             FastRCNNPredictor(in_feat, self.config.num_classes + 1)
 
+    @property
+    def num_classes(self):
+        """
+        int: Number of the classes taking into account the background
+        """
+        return self.config.num_classes + 1
+
     def forward(self, inputs, target=None):
         """
         Forward pass
@@ -275,6 +282,9 @@ class Model(nn.Module):
             size=(batch_size, 3, self.config.im_size, self.config.im_size),
             device=device)
         summary(self.estimator, input_data=samples)
+
+    def weights(self):
+        return self.estimator.state_dict()
 
     def save(self, file_path):
         """
@@ -506,105 +516,144 @@ def calculate_average_precision(precision, recall):
     return average_precision
 
 
-def calculate_map50(
-    pred_boxes_list, pred_labels_list, pred_scores_list,
-    true_boxes_list, true_labels_list, num_classes: int = None
-):
+
+class MAP:
     """
-    Calculate mAP50 across all classes and images
+    Mean Average Precision
+    ======================
 
     Args:
-        pred_boxes_list (typing.List[torch.Tensor]): List of tensors
-            with predicted bounding boxes [x1, y1, x2, y2] for each image
-        pred_labels_list (typing.List[torch.Tensor]): List of tensors
-            with predicted class labels for each image
-        pred_scores_list (typing.List[torch.Tensor]): List of tensors
-            with confidence scores for predictions for each image
-        true_boxes_list (typing.List[torch.Tensor]): List of tensors
-            with ground truth bounding boxes [x1, y1, x2, y2] for each image
-        true_labels_list (typing.List[torch.Tensor]): List of tensors
-            with ground truth class labels for each image
-        num_classes: Number of classes in the dataset
-
-    Returns:
-        float: mAP50 Mean Average Precision at IoU threshold of 0.5
-        typing.Dict[int, float]: class_aps Dictionary mapping class_id
-            to AP value
+        threshold (float): The IOU threshold
+        num_classes (int): Number of classes
     """
-    # Determine the number of classes if not provided
-    if num_classes is None:
-        max_pred_class = max(
-            [torch.max(labels).item() if len(labels) > 0 else -1
-             for labels in pred_labels_list])
-        max_true_class = max(
-            [torch.max(labels).item() if len(labels) > 0 else -1
-             for labels in true_labels_list])
-        num_classes = max(max_pred_class, max_true_class) + 1
+    def __init__(self, threshold, num_classes=None):
+        self.threshold = threshold
+        self.num_classes = num_classes
 
-    # Aggregate precision and recall dictionaries across all images
-    all_precisions = defaultdict(list)
-    all_recalls = defaultdict(list)
-    gt_counts = defaultdict(int)
+        self.pred_boxes_list = []
+        self.pred_labels_list = []
+        self.pred_scores_list = []
+        self.true_boxes_list = []
+        self.true_labels_list = []
 
-    # Process each image
-    for pred_boxes, pred_labels, pred_scores, true_boxes, true_labels in zip(
+    def calculate(self):
+        """
+        Calculate mAP across all classes and images
+
+        Returns:
+            float: mAP50 Mean Average Precision at IoU threshold of 0.5
+            typing.Dict[int, float]: class_aps Dictionary mapping class_id
+                to AP value
+        """
+        pred_boxes_list = self.pred_boxes_list
+        pred_labels_list = self.pred_labels_list
+        pred_scores_list = self.pred_scores_list
+        true_boxes_list = self.true_boxes_list
+        true_labels_list = self.true_labels_list
+
+        if not pred_boxes_list:
+            return 0.0, {}
+
+        # Determine the number of classes if not provided
+        if self.num_classes is None:
+            max_pred_class = max(
+                [torch.max(labels).item() if len(labels) > 0 else -1
+                 for labels in pred_labels_list])
+            max_true_class = max(
+                [torch.max(labels).item() if len(labels) > 0 else -1
+                 for labels in true_labels_list])
+            self.num_classes = max(max_pred_class, max_true_class) + 1
+
+        # Aggregate precision and recall dictionaries across all images
+        all_precisions = defaultdict(list)
+        all_recalls = defaultdict(list)
+        gt_counts = defaultdict(int)
+
+        # Process each image
+        iteration = zip(
             pred_boxes_list, pred_labels_list, pred_scores_list,
-            true_boxes_list, true_labels_list
-    ):
-        # Skip if there are no predictions or ground truth
-        if len(pred_boxes) == 0 or len(true_boxes) == 0:
-            continue
+            true_boxes_list, true_labels_list)
+        for elm in iteration:
+            pred_boxes, pred_labels, pred_scores, true_boxes, true_labels = elm
 
-        # Calculate precision and recall for this image
-        precision_dict, recall_dict, gt_count_dict = calculate_precision_recall(
-            pred_boxes, pred_labels, pred_scores,
-            true_boxes, true_labels,
-            iou_threshold=0.5,
-            num_classes=num_classes
-        )
+            # Skip if there are no predictions or ground truth
+            if len(pred_boxes) == 0 or len(true_boxes) == 0:
+                continue
 
-        # Update global dictionaries
-        for class_id in range(num_classes):
-            if class_id in precision_dict:
-                all_precisions[class_id].extend(precision_dict[class_id])
-                all_recalls[class_id].extend(recall_dict[class_id])
-            gt_counts[class_id] += gt_count_dict[class_id]
+            # Calculate precision and recall for this image
+            ret = calculate_precision_recall(
+                pred_boxes, pred_labels, pred_scores,
+                true_boxes, true_labels,
+                iou_threshold=self.threshold,
+                num_classes=self.num_classes
+            )
+            precision_dict, recall_dict, gt_count_dict = ret
 
-    # Calculate AP for each class
-    class_aps = {}
-    valid_classes = 0
-    sum_ap = 0.0
+            # Update global dictionaries
+            for class_id in range(self.num_classes):
+                if class_id in precision_dict:
+                    all_precisions[class_id].extend(precision_dict[class_id])
+                    all_recalls[class_id].extend(recall_dict[class_id])
+                gt_counts[class_id] += gt_count_dict[class_id]
 
-    for class_id in range(num_classes):
-        # Skip classes with no ground truth instances
-        if gt_counts[class_id] == 0:
-            class_aps[class_id] = 0.0
-            continue
+        # Calculate AP for each class
+        class_aps = {}
+        valid_classes = 0
+        sum_ap = 0.0
 
-        # Sort precision and recall values by recall
-        if len(all_recalls[class_id]) > 0:
-            paired = sorted(
-                zip(all_recalls[class_id], all_precisions[class_id]))
-            recalls_sorted = [r for r, _ in paired]
-            precisions_sorted = [p for _, p in paired]
+        for class_id in range(self.num_classes):
+            # Skip classes with no ground truth instances
+            if gt_counts[class_id] == 0:
+                class_aps[class_id] = 0.0
+                continue
 
-            # Calculate AP for this class
-            ap = calculate_average_precision(precisions_sorted, recalls_sorted)
-            class_aps[class_id] = ap
-            sum_ap += ap
-            valid_classes += 1
-        else:
-            class_aps[class_id] = 0.0
+            # Sort precision and recall values by recall
+            if len(all_recalls[class_id]) > 0:
+                paired = sorted(
+                    zip(all_recalls[class_id], all_precisions[class_id]))
+                recalls_sorted = [r for r, _ in paired]
+                precisions_sorted = [p for _, p in paired]
 
-    # Calculate mAP50
-    map50 = sum_ap / valid_classes if valid_classes > 0 else 0.0
+                # Calculate AP for this class
+                ap = calculate_average_precision(precisions_sorted,
+                                                 recalls_sorted)
+                class_aps[class_id] = ap
+                sum_ap += ap
+                valid_classes += 1
+            else:
+                class_aps[class_id] = 0.0
 
-    return map50, class_aps
+        # Calculate mAP
+        mapx = sum_ap / valid_classes if valid_classes > 0 else 0.0
+        return mapx, class_aps
 
+    def update(self, predictions, targets):
+        pred_boxes_list = [predict['boxes'] for predict in predictions]
+        pred_labels_list = [predict['labels'] for predict in predictions]
+        pred_scores_list = [predict['scores'] for predict in predictions]
+        true_boxes_list = [target['boxes'] for target in targets]
+        true_labels_list = [target['labels'] for target in targets]
 
-class mAP50:
-    def __init__(self):
-        ...
+        self.pred_boxes_list.extend(pred_boxes_list)
+        self.pred_labels_list.extend(pred_labels_list)
+        self.pred_scores_list.extend(pred_scores_list)
+        self.true_boxes_list.extend(true_boxes_list)
+        self.true_labels_list.extend(true_labels_list)
+
+        return (
+            pred_boxes_list, pred_labels_list, pred_scores_list,
+            true_boxes_list, true_labels_list)
+
+    def clear(self):
+        self.pred_boxes_list.clear()
+        self.pred_labels_list.clear()
+        self.pred_scores_list.clear()
+        self.true_boxes_list.clear()
+        self.true_labels_list.clear()
+
+    def __call__(self):
+        maps, class_aps = self.calculate()
+        return maps, class_aps
 
 
 class InferenceStorage:
@@ -689,11 +738,12 @@ class Trainer(Model):
             checkpoint = torch.load(
                 checkpoint_file, map_location='cpu', weights_only=False)
             config = cls.Config()
-            if 'model_hparams' in checkpoint:
-                config.__dict__.update(checkpoint['model_hparams'])
+            if 'model_config' in checkpoint:
+                config.__dict__.update(checkpoint['model_config'])
             instance = cls(config)
             if 'model_state_dict' in checkpoint:
-                instance.load_state_dict(checkpoint['model_state_dict'])
+                instance.estimator.load_state_dict(
+                    checkpoint['model_state_dict'])
 
         return instance
 
@@ -713,6 +763,8 @@ class Trainer(Model):
         self.loss_rpn_box_reg = AvgMeter()
 
         self.inference_store = None
+        self.mAP50 = None
+        self.mAP95 = None
 
         self.gas = 128  # Gradiant Accumulation Steps
         self.seed = 42  # Seed number for random generation
@@ -779,6 +831,8 @@ class Trainer(Model):
         self.checkpoint_dir = args.checkpoint_dir
 
         self.inference_store = InferenceStorage(args.inference_store)
+        self.mAP50 = MAP(0.50, len(val_dataset.label_names) + 1)
+        self.mAP95 = MAP(0.95, len(val_dataset.label_names) + 1)
 
     @staticmethod
     def _update_losses(input_losses, output_losses):
@@ -812,6 +866,7 @@ class Trainer(Model):
 
     def checkpoint(self, **kwargs):
         checkpoint = {
+            "model_config": self.config.__dict__,
             "model_state_dict": self.estimator.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
@@ -916,6 +971,12 @@ class Trainer(Model):
 
     def validate(self):
         device = self.device()
+        self.inference_store.clear()
+        self.mAP50.clear()
+        self.mAP95.clear()
+
+        metrics = {}
+
         self.eval()
         with torch.no_grad():
             iterator = tqdm(self.val_loader, desc="val")
@@ -930,9 +991,18 @@ class Trainer(Model):
                 # iterator.write(str(predictions))
 
                 self.inference_store.add(predictions, targets)
+                self.mAP50.update(predictions, targets)
+                self.mAP95.update(predictions, targets)
+
+                mAP50, _ = self.mAP50()
+                mAP95, _ = self.mAP95()
+                metrics = {"mAP50": mAP50, "mAP95": mAP95}
+                iterator.set_postfix(metrics)
 
                 # boxes_predictions.append(predictions[0]['boxes'])
                 # labels_predictions.append(predictions[0]['labels'])
+
+        return metrics
 
     def fit(self):
         """
