@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 # Set seeds for reproducibility
 def set_seed(seed=42):
+    """
+    Setting the seed for all the random generator
+    """
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -68,7 +71,7 @@ class Dataset(data.Dataset):
         ------------------
 
         Returns the class names list contained
-        in YAML file located at file_path.
+        in YAML file located at file_path
 
         :param file_path: The file path of the YAML file
         :type file_path: `str`
@@ -156,8 +159,8 @@ class Dataset(data.Dataset):
                     f"The class ID {class_id} is not in available classes.")
 
     def __len__(self):
-        # return len(self.images)
-        return 20
+        return len(self.images)
+        # return 20
 
     def __getitem__(self, idx):
         img_path = os.path.join(self.img_dir, self.images[idx])
@@ -627,9 +630,15 @@ class MAP:
         return mapx, class_aps
 
     def update(self, predictions, targets):
-        pred_boxes_list = [predict['boxes'].cpu() for predict in predictions]
-        pred_labels_list = [predict['labels'].cpu() for predict in predictions]
-        pred_scores_list = [predict['scores'].cpu() for predict in predictions]
+        pred_boxes_list = [
+            predict['boxes'].detach().cpu() for predict in predictions
+        ]
+        pred_labels_list = [
+            predict['labels'].detach().cpu() for predict in predictions
+        ]
+        pred_scores_list = [
+            predict['scores'].detach().cpu() for predict in predictions
+        ]
         true_boxes_list = [target['boxes'].cpu() for target in targets]
         true_labels_list = [target['labels'].cpu() for target in targets]
 
@@ -1015,10 +1024,10 @@ class Trainer(Model):
 
     def validate(self):
         device = self.device()
-        self.inference_store.clear()
+        # self.inference_store.clear()
         self.mAP50.clear()
+        self.mAP75.clear()
         self.mAP95.clear()
-
         metrics = {}
 
         self.eval()
@@ -1097,7 +1106,7 @@ def parse_argument():
     """
     Command line argument parsing
     """
-    parser = ArgumentParser(prog="ResNet FasterRCNN Train")
+    parser = ArgumentParser(prog="ResNet FasterRCNN FPN v2 Train")
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('-d', '--dataset-dir', type=str, required=True)
     parser.add_argument('-b', '--batch-size', type=int, default=1)
