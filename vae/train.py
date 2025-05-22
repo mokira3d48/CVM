@@ -215,10 +215,12 @@ def test_residual_block():
 
 
 class Encoder(nn.Sequential):
-    def __init__(self, num_channels=3, num_groups=32, scale_factor=0.18215):
+    def __init__(
+        self, img_channels=3, zch=8, num_groups=32, mult_factor=0.18215
+    ):
         # Conv2D(in_ch, out_ch, ks, s, p)
         super().__init__(
-            nn.Conv2d(num_channels, 128, 3, 1, 1), # [n, 128, h, w]
+            nn.Conv2d(img_channels, 128, 3, 1, 1), # [n, 128, h, w]
             ResidualBlock(128, 128, num_groups),   # [n, 128, h, w]
             nn.Conv2d(128, 128, 3, 2, 0),          # [n, 128, h / 2, w / 2]
 
@@ -239,12 +241,12 @@ class Encoder(nn.Sequential):
             nn.GroupNorm(num_groups, 512),        # [n, 512, h / 8, w / 8]
             nn.SiLU(),                            # [n, 512, h / 8, w / 8]
 
-            nn.Conv2d(512, 8, 3, 1, 1),  # [n, 8, h / 8, w / 8]
-            nn.Conv2d(8, 8, 1, 1, 0),    # [n, 8, h / 8, w / 8]
+            nn.Conv2d(512, zch, 3, 1, 1),  # [n, zch, h / 8, w / 8]
+            nn.Conv2d(zch, zch, 1, 1, 0),  # [n, zch, h / 8, w / 8]
 
         )
 
-        self.scale_factor = scale_factor
+        self.mult_factor = mult_factor
 
     def forward(self, x):
         """
@@ -254,8 +256,8 @@ class Encoder(nn.Sequential):
         :param x: [batch_size, num_channels, h, w],
           num_channels can be equal to 3, if the images is in RGB,
           or it can be equal to 1, if the images is in Gray scale.
-        :returns: tensor with [batch_size, 4, h / 8, w / 8] representing
-          the latent representation encoded.
+        :returns: tensor with [batch_size, z_channels / 2, h / 8, w / 8]
+          representing the latent representation encoded.
 
         :type x: torch.Tensor
         :rtype: torch.Tensor
@@ -265,8 +267,9 @@ class Encoder(nn.Sequential):
                 x = F.pad(x, (0, 1, 0, 1))  # (left, right, top, bottom)
             x = module(x)
 
-        # We split the tensor x with dim [n, 8, h / 8, w / 8] into two tensors
-        #   of equal dimensions: [n, 4, h / 8, w / 8]
+        # We split the tensor x with dim [n, z_channels, h / 8, w / 8]
+        #   into two tensors of equal dimensions:
+        #   [n, z_channels / 2, h / 8, w / 8]
         mean, log_variance = torch.chunk(x, 2, dim=1)
 
         # Clamp log variance between -30 and 20
@@ -277,12 +280,12 @@ class Encoder(nn.Sequential):
         eps = torch.randn_like(std)
         x = mean + eps * std
 
-        out = x * self.scale_factor
+        out = x * self.mult_factor
         return out
 
 
 def test_encoder():
-    encoder = Encoder(num_channels=3)
+    encoder = Encoder(img_channels=3)
     encoder = encoder.to(device)
 
     inputs = torch.randn((1, 3, 224, 224))
@@ -294,6 +297,79 @@ def test_encoder():
     assert outputs.shape == (4, 4, 28, 28)
     logger.info(str(outputs.shape))
 
+
+class Decoder(nn.Sequential):
+    def __init__(
+        self, img_channels=3, zch=8, num_groups=32, mult_factor=0.18215
+    ):
+        super().__init__(
+            nn.Conv2d(zch // 2, 512, 3, 1, 1),  # [n, 512, h / 8, w / 8]
+            ResidualBlock(512, 512),            # [n, 512, h / 8, w / 8]
+
+            AttentionBlock(512),      # [n, 512, h / 8, w / 8]
+            ResidualBlock(512, 512),  # [n, 512, h / 8, w / 8]
+            ResidualBlock(512, 512),  # [n, 512, h / 8, w / 8]
+            ResidualBlock(512, 512),  # [n, 512, h / 8, w / 8]
+
+            nn.Upsample(scale_factor=2),   # [n, 512, h / 4, w / 4]
+            nn.Conv2d(512, 512, 3, 1, 1),  # [n, 512, h / 4, w / 4]
+            ResidualBlock(512, 512),       # [n, 512, h / 4, w / 4]
+            ResidualBlock(512, 512),       # [n, 512, h / 4, w / 4]
+            ResidualBlock(512, 512),       # [n, 512, h / 4, w / 4]
+
+            nn.Upsample(scale_factor=2),  # [n, 512, h / 2, w / 2]
+            nn.Conv2d(512, 512, 3, 1, 1), # [n, 512, h / 2, w / 2]
+            ResidualBlock(512, 256),      # [n, 256, h / 2, w / 2]
+            ResidualBlock(256, 256),      # [n, 256, h / 2, w / 2]
+            ResidualBlock(256, 256),      # [n, 256, h / 2, w / 2]
+
+            nn.Upsample(scale_factor=2),  # [n, 256, h, w]
+            nn.Conv2d(256, 256, 3, 1, 1), # [n, 256, h, w]
+            ResidualBlock(256, 128),      # [n, 128, h, w]
+            ResidualBlock(128, 128),      # [n, 128, h, w]
+            ResidualBlock(128, 128),      # [n, 128, h, w]
+
+            nn.GroupNorm(num_groups, 128),  # [n, 128, h, w]
+            nn.SiLU(),                      # [n, 128, h, w]
+
+            nn.Conv2d(128, img_channels, 3, 1, 1)  # [n, img_channels, h, w]
+        )
+
+        self.mult_factor = mult_factor
+
+    def forward(self, x):
+        """
+        Forward pass
+        ------------
+
+        :param x: [batch_size, zch, h, w], zch representing the latent
+          representation channels, its value is chosen according zch of encoder
+          latent representation;
+        :returns: tensor with [batch_size, img_channels, h, w]
+          representing the reconstructed image.
+
+        :type x: torch.Tensor
+        :rtype: torch.Tensor
+        """
+        x = x / self.mult_factor  # remove the scaling adding by the encoder;
+
+        for module in self:
+            x = module(x)
+        return x
+
+
+def test_decoder():
+    decoder = Decoder(img_channels=3)
+    decoder = decoder.to(device)
+
+    inputs = torch.randn((1, 4, 28, 28))
+    inputs = inputs.to(device)
+    summary(decoder, input_data=inputs)
+
+    inputs = torch.randn((4, 4, 28, 28))
+    outputs = decoder(inputs)
+    assert outputs.shape == (4, 3, 224, 224)
+    logger.info(str(outputs.shape))
 
 
 def main():
