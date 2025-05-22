@@ -8,11 +8,14 @@ __author__ = 'Dr Mokira'
 import os
 import math
 import logging
+from shutil import copy
 from dataclasses import dataclass
+from argparse import ArgumentParser
 
 import yaml
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
@@ -464,8 +467,18 @@ class ModelConfig:
     out_proj_bias = True
     mult_factor = 0.18215
 
+    def data(self):
+        return {"img_channels": self.img_channels,
+                "img_size": self.img_size,
+                "num_groups": self.num_groups,
+                "zch": self.zch,
+                "n_heads": self.n_heads,
+                "in_proj_bias": self.in_proj_bias,
+                "out_proj_bias": self.out_proj_bias,
+                "mult_factor": self.mult_factor}
+
     def save(self, file_path):
-        data = self.__dict__
+        data = self.data()
         with open(file_path, mode='w', encoding='utf-8') as f:
             yaml.dump(data, f)
 
@@ -530,7 +543,9 @@ def load_module(file_path, module, map_location='cpu'):
         file_path, weights_only=True, map_location=map_location
     )
     module.load_state_dict(weights)
-    logger.info(f"Model weights of {module.__name__} loaded successfully!")
+    logger.info(
+        f"Model weights of {module.__class__.__name__} loaded successfully!"
+    )
     return module
 
 
@@ -551,11 +566,12 @@ class Model(VAE):
         """
         model_device = self.device()
         img_channels = self.config.img_channels
+        zch = self.config.zch
         img_size = self.config.img_size
 
         input_encoder = torch.randn((batch_size, img_channels, *img_size))
         input_decoder = torch.randn(
-            (batch_size, img_channels, img_size[0] // 8, img_size[1] // 8)
+            (batch_size, zch // 2, img_size[0] // 8, img_size[1] // 8)
         )
         input_encoder = input_encoder.to(model_device)
         input_decoder = input_decoder.to(model_device)
@@ -631,6 +647,8 @@ class Model(VAE):
 
 
 def test_model_save_load():
+    import shutil
+
     instance = Model()
     instance.save_encoder("encoder_file")
     instance.save_decoder("decoder_file")
@@ -643,6 +661,11 @@ def test_model_save_load():
     assert os.path.isfile("decoder_file/weights.pth")
 
     # Load encoder and decoder from file
+    loaded_instance = Model.load("encoder_file", "decoder_file")
+    loaded_instance.summary()
+
+    shutil.rmtree("encoder_file")
+    shutil.rmtree("decoder_file")
 
 
 ###############################################################################
@@ -677,15 +700,437 @@ class Dataset(BaseDataset):
         image = Image.open(image_file)
         image = image.convert('RGB')
         image = np.asarray(image, dtype=np.uint8)
-        image = torch.tensor(image)
-        return image
+        input_image = torch.tensor(image)
+        output_image = torch.tensor(image)
+        return input_image, output_image
+
+
+###############################################################################
+# TRAINING PROCESS
+###############################################################################
+
+class AvgMeter:
+
+    def __init__(self, val=0):
+        self.total = val
+        self.count = 0
+
+    def reset(self):
+        self.total = 0.0
+        self.count = 0
+
+    def __add__(self, other):
+        """
+        Add function
+
+        :type other: `float`|`int`
+        """
+        self.total += other
+        self.count += 1
+        return self
+
+    def __radd__(self, other):
+        return self.__add__(other)
+
+    def avg(self):
+        if self.count > 0:
+            return self.total / self.count
+        else:
+            return 0.0
+
+    def __str__(self):
+        return str(self.total)
+
+
+class Trainer(Model):
+    """
+    Training model
+    ==============
+    """
+    @classmethod
+    def load(cls, encoder_file=None, decoder_file=None, checkpoint_file=None):
+        """
+        Static method to load model state dict from files or checkpoints
+
+        :param encoder_file: The encoder model file contained its weights
+          and config;
+        :param decoder_file: The decoder model file contained its weights
+          and config;
+        :param checkpoint_file: The file path to the training checkpoint;
+        :returns: The instance of the VAE model.
+
+        :type encoder_file: `str`
+        :type decoder_file: `str`
+        :type checkpoint_file: `str`
+        :rtype: Trainer
+        """
+        instance = None
+        if encoder_file or decoder_file:
+            instance = super().load(encoder_file, decoder_file)
+
+        if not instance and os.path.isfile(checkpoint_file):
+            checkpoint = torch.load(
+                checkpoint_file, map_location='cpu', weights_only=False
+            )
+
+            config = ModelConfig()
+            if 'model_config' in checkpoint:
+                config.__dict__.update(checkpoint['model_config'])
+                logger.info("VAE model config is loaded from checkpoint!")
+
+            instance = cls(config)
+            if 'encoder_model_state_dict' in checkpoint:
+                instance.encoder.load_state_dict(
+                    checkpoint['encoder_model_state_dict'])
+                logger.info(
+                    "Encoder model state dict is loaded from checkpoint!")
+            if 'decoder_model_state_dict' in checkpoint:
+                instance.decoder.load_state_dict(
+                    checkpoint['decoder_model_state_dict'])
+                logger.info(
+                    "Decoder model state dict is loaded from checkpoint!")
+
+        return instance
+
+    def __init__(self, config=None):
+        super().__init__(config)
+
+        self.train_loader = None
+        self.val_loader = None
+
+        self.optimizer = None
+        self.lr_scheduler = None
+
+        self.train_losses = {}
+        self.val_losses = {}
+        self.loss_classifier = AvgMeter()
+        self.loss_box_reg = AvgMeter()
+
+        self.inference_store = None
+        self.mAP50 = None
+        self.mAP75 = None
+        self.mAP95 = None
+
+        self.gas = 128  # Gradiant Accumulation Steps
+        self.seed = 42  # Seed number for random generation
+        self.num_epochs = 1
+        self.batch_size = 1
+
+        self.gac = 0  # Gradient Accumulation Count
+
+        self.checkpoint_dir = "checkpoints"
+        self.resume_ckpt = None
+        self.best_model = None
+        self.epoch = 0
+
+    def compile(self, args):
+        """
+        Initialization of training process
+        ----------------------------------
+
+        :type args: `argparse.Namespace`
+        :rtype: `None`
+        """
+        # torch.manual_seed(args.seed)
+        # np.random.seed(args.seed)
+        set_seed(args.seed)
+
+        self.num_epochs = args.epochs
+        self.batch_size = args.batch_size
+        self.gas = args.gas
+
+        dataset_dir = args.dataset_dir
+        train_ds_dir = os.path.join(dataset_dir, 'train')
+        val_ds_dir = os.path.join(dataset_dir, 'val')
+        ds_config_file = os.path.join(dataset_dir, 'data.yaml')
+        if not os.path.isdir(train_ds_dir):
+            raise FileNotFoundError(
+                f"No such training set directory at {train_ds_dir}")
+        if not os.path.isdir(val_ds_dir):
+            raise FileNotFoundError(
+                f"No such validation set directory at {val_ds_dir}")
+        if not os.path.isfile(ds_config_file):
+            raise FileNotFoundError(
+                f"No such dataset config file at {ds_config_file}")
+        train_dataset = Dataset(train_ds_dir)
+        val_dataset = Dataset(val_ds_dir)
+
+        # Create data loaders
+        self.train_loader = data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True)
+        self.val_loader = data.DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False)
+
+        # Set up the optimizer
+        self.optimizer = torch.optim.AdamW(
+            self.parameters(), lr=args.learning_rate,
+            weight_decay=args.weight_decay)
+
+        # Learning rate scheduler
+        self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
+            self.optimizer, step_size=3, gamma=0.1)
+
+        self.resume_ckpt = args.resume
+        self.checkpoint_dir = args.checkpoint_dir
+        self.best_model = args.best_model
+
+    @staticmethod
+    def _update_losses(input_losses, output_losses):
+        """
+        Update losses value
+        """
+        for key, val in input_losses.items():
+            if key in output_losses:
+                output_losses[key] += val
+            else:
+                new_loss = AvgMeter(val)
+                output_losses[key] = new_loss
+
+    @staticmethod
+    def print_results(res):
+        """
+        Function of average meter losses
+        """
+        string = ''
+        for key, val in res.items():
+            string += f"{key}: {val:.8f} "
+        return string
+
+    @staticmethod
+    def _add_to_epoch_results(epc_res, new_res):
+        for key, val in epc_res.items():
+            if key in epc_res:
+                epc_res[key].append(new_res[key])
+            else:
+                epc_res[key] = [new_res[key]]
+
+    def checkpoint(self, **kwargs):
+        checkpoint = {
+            "model_config": self.config.__dict__,
+            "encoder_model_state_dict": self.encoder.state_dict(),
+            "decoder_model_state_dict": self.decoder.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
+            "epoch": self.epoch,
+            "train_losses": self.train_losses,
+            "val_losses": self.val_losses,
+            # "best_performance": self.best_performance,
+            **kwargs}
+
+        file_path1 = os.path.join(
+            self.checkpoint_dir, "checkpoint.pth")
+        file_path2 = os.path.join(
+            self.checkpoint_dir, f"checkpoint_{self.epoch}.pth")
+        torch.save(checkpoint, file_path1)
+        copy(file_path1, file_path2)
+        logger.info("Checkpoint done successfully")
+
+        if self.epoch >= 2 and (self.epoch % 2) == 0:
+            old_checkpoint_file = os.path.join(
+                self.checkpoint_dir, f"checkpoint_{self.epoch - 2}.pth")
+            if os.path.isfile(old_checkpoint_file):
+                os.remove(old_checkpoint_file)
+                logger.info(f"{old_checkpoint_file} checkpoint is removed.")
+
+    def load_checkpoint(self):
+        if not self.resume_ckpt:
+            return
+        if not os.path.isfile(self.resume_ckpt):
+            logger.info(f"No such checkpoint file at {self.resume_ckpt}")
+            return
+
+        ckpt_data = torch.load(
+            self.resume_ckpt, weights_only=False, map_location='cpu')
+        self.optimizer.load_state_dict(ckpt_data['optimizer_state_dict'])
+        self.lr_scheduler.load_state_dict(ckpt_data['lr_scheduler_state_dict'])
+        self.epoch = ckpt_data['epoch'] + 1
+        self.train_losses = ckpt_data['train_losses']
+        self.val_losses = ckpt_data['val_losses']
+        # self.best_performance = ckpt_data['best_performance']
+        logger.info(f"Checkpoint loaded successfully from {self.resume_ckpt}!")
+
+    def train_step(self, images, targets, write_fn, optimize=False):
+        """
+        Training method on one batch
+        """
+        # Forward pass and loss compute
+        reconstructed_image = self.forward(images)
+
+        # Backward pass
+        loss.backward()
+
+        self.gac += len(images)
+        if self.gac >= self.gas or optimize:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+            write_fn(
+                "Optim step"
+                f" - loss classifier: {self.loss_classifier.avg():.8f}"
+                f" - loss box reg: {self.loss_box_reg.avg():.8f}"
+                f" - loss objectness: {self.loss_objectness.avg():.8f}"
+                f" - loss rpn box reg: {self.loss_rpn_box_reg.avg():.8f}")
+            self.gac = 0
+
+    def train_one_epoch(self):
+        """
+        Method of training on one epoch
+        """
+        model_device = self.device()
+        loss_data = {}
+
+        length = len(self.train_loader)
+        iterator = tqdm(self.train_loader, desc="train")
+        write_fn = iterator.write
+
+        self.train()
+        self.optimizer.zero_grad()
+        for index, (images, targets) in enumerate(iterator):
+            images = images.to(model_device)  # noqa
+            targets = targets.to(model_device)
+
+            # At last iteration, the gradient accumulation count can not
+            # be equal to gradient accumulation step, so we must perform
+            # optimization step when we are at the last iteration (length - 1)
+            last_index = index >= (length - 1)
+            self.train_step(images, targets, write_fn, last_index)
+
+            # loss_data = {
+            #     "loss_classifier": self.loss_classifier.avg(),
+            #     "loss_box_reg": self.loss_box_reg.avg(),
+            #     "loss_objectness": self.loss_objectness.avg(),
+            #     "loss_rpn_box_reg": self.loss_rpn_box_reg.avg()}
+            # iterator.set_postfix(loss_data)
+
+        return loss_data
+
+    def validate(self):
+        model_device = self.device()
+
+        self.eval()
+        with torch.no_grad():
+            iterator = tqdm(self.val_loader, desc="val")
+
+            for images, targets in iterator:
+                images = images.to(model_device)  # noqa
+                targets = targets.to(model_device)
+
+                # Forward pass
+                reconstructed_image = self.forward(images)
+
+        return {}
+
+    def fit(self):
+        """
+        Training process
+        ----------------
+
+        Run the training loop and returns the results
+        formatted as dictionary.
+
+        :rtype: `dict`
+        """
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.load_checkpoint()
+
+        for epoch in range(self.epoch, self.num_epochs):
+            self.epoch = epoch
+            logger.info(f'Epoch: {epoch + 1} / {self.num_epochs}:\n')
+
+            train_losses = self.train_one_epoch()
+
+            # Update the learning rate
+            self.lr_scheduler.step()
+
+            # Add losses to train losses epochs
+            # Save checkpoint with the current model state
+            self._add_to_epoch_results(self.train_losses, train_losses)
+
+            logger.info(f'{self.print_results(train_losses)}')
+
+            # Make checkpoint after training
+            self.checkpoint()
+
+            val_losses = self.validate()
+
+            self._add_to_epoch_results(self.val_losses, val_losses)
+
+            logger.info(f'{self.print_results(val_losses)}')
+
+            # Make checkpoint after validation
+            self.checkpoint()
+
+            if epoch != (self.num_epochs - 1):
+                # Epochs are remaining
+                logger.info("-" * 80)
+
+
+def parse_argument():
+    """
+    Command line argument parsing
+    """
+    parser = ArgumentParser(prog="ResNet FasterRCNN FPN v2 Train")
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('-d', '--dataset-dir', type=str, required=True)
+    parser.add_argument('-b', '--batch-size', type=int, default=1)
+
+    parser.add_argument('--image-size', type=int, default=224)
+
+    parser.add_argument('-n', '--epochs', type=int, default=2)
+    parser.add_argument('-lr', '--learning-rate', type=float, default=1e-4)
+    parser.add_argument('--weight-decay', type=float, default=0.0005)
+    parser.add_argument('-gas', type=int, default=128)
+
+    parser.add_argument('-r', "--resume", type=str)
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
+    parser.add_argument('--encoder-model', type=str)
+    parser.add_argument('--decoder-model', type=str)
+    parser.add_argument('--best-model', type=str, default="best")
+
+    args = parser.parse_args()
+    logger.info("Training arguments:")
+    for arg, value in vars(args).items():
+        logger.info(f"  {arg}: {value}")
+    return args
 
 
 def main():
     """
     Main function to run train process
     """
-    ...
+    args = parse_argument()
+
+    model_file = args.model_file
+    checkpoint = args.resume
+    model = None
+    if checkpoint:
+        model = Trainer.load(checkpoint_file=checkpoint)
+    if not model and model_file:
+        model = Trainer.load(model_file)
+    if not model:
+        hparams = Trainer.Config()
+        hparams.backbone = args.backbone
+        hparams.im_size = args.image_size
+
+        # Open dataset config
+        # and get number of class names
+        ds_config_file = os.path.join(args.dataset_dir, 'data.yaml')
+        if not os.path.isfile(ds_config_file):
+            logger.error(f"No such config file at {ds_config_file}")
+            exit(2)
+        with open(ds_config_file, mode='r', encoding='utf-8') as file:
+            config = yaml.safe_load(file)
+            nc = len(config['names'])
+            hparams.num_classes = nc
+
+        model = Trainer(hparams)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
+    model.compile(args)
+    model.summary()
+    model.fit()
 
 
 if __name__ == '__main__':
@@ -693,4 +1138,5 @@ if __name__ == '__main__':
         main()
         exit(0)
     except KeyboardInterrupt:
+        print("\033[91mCanceled by user!\033[0m")
         exit(125)
