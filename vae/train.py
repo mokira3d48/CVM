@@ -8,6 +8,11 @@ __author__ = 'Dr Mokira'
 import os
 import math
 import logging
+from dataclasses import dataclass
+
+import yaml
+import numpy as np
+from PIL import Image
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +20,10 @@ from torch import nn
 from torchinfo import summary
 
 from torch.utils import data
+from torch.utils.data import Dataset as BaseDataset
+# from torchvision import transforms
+
+import torchvision.transforms.functional as TF
 
 # Set up logging
 logging.basicConfig(
@@ -28,6 +37,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+
+def set_seed(seed=42):
+    """
+    Setting the seed for all the random generator
+    """
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+###############################################################################
+# MODEL IMPLEMENTATION
+###############################################################################
 
 class SelfAttention(nn.Module):
     def __init__(
@@ -107,10 +131,14 @@ def test_self_attention():
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, num_channels, num_groups=32, num_heads=1):
+    def __init__(
+        self, num_channels, num_groups=32, n_heads=1, in_proj_bias=True,
+        out_proj_bias=True
+    ):
         super().__init__()
         self.group_norm = nn.GroupNorm(num_groups, num_channels)
-        self.attention = SelfAttention(num_channels, num_heads)
+        self.attention = SelfAttention(num_channels,
+                                       n_heads, in_proj_bias, out_proj_bias)
 
     def forward(self, x):
         """
@@ -216,9 +244,13 @@ def test_residual_block():
 
 class Encoder(nn.Sequential):
     def __init__(
-        self, img_channels=3, zch=8, num_groups=32, mult_factor=0.18215
+        self, img_channels=3, zch=8, num_groups=32, n_heads=1,
+        in_proj_bias=True, out_proj_bias=True, mult_factor=0.18215
     ):
         # Conv2D(in_ch, out_ch, ks, s, p)
+        attention_block = AttentionBlock(
+            512, num_groups, n_heads, in_proj_bias, out_proj_bias
+        )
         super().__init__(
             nn.Conv2d(img_channels, 128, 3, 1, 1), # [n, 128, h, w]
             ResidualBlock(128, 128, num_groups),   # [n, 128, h, w]
@@ -236,7 +268,7 @@ class Encoder(nn.Sequential):
             ResidualBlock(512, 512, num_groups),  # [n, 512, h / 8, w / 8]
             ResidualBlock(512, 512, num_groups),  # [n, 512, h / 8, w / 8]
 
-            AttentionBlock(512),                  # [n, 512, h / 8, w / 8]
+            attention_block,                      # [n, 512, h / 8, w / 8]
             ResidualBlock(512, 512, num_groups),  # [n, 512, h / 8, w / 8]
             nn.GroupNorm(num_groups, 512),        # [n, 512, h / 8, w / 8]
             nn.SiLU(),                            # [n, 512, h / 8, w / 8]
@@ -300,13 +332,17 @@ def test_encoder():
 
 class Decoder(nn.Sequential):
     def __init__(
-        self, img_channels=3, zch=8, num_groups=32, mult_factor=0.18215
+        self, img_channels=3, zch=8, num_groups=32, n_heads=1,
+        in_proj_bias=True, out_proj_bias=True, mult_factor=0.18215
     ):
+        attention_block = AttentionBlock(
+            512, num_groups, n_heads, in_proj_bias, out_proj_bias
+        )
         super().__init__(
             nn.Conv2d(zch // 2, 512, 3, 1, 1),  # [n, 512, h / 8, w / 8]
             ResidualBlock(512, 512),            # [n, 512, h / 8, w / 8]
 
-            AttentionBlock(512),      # [n, 512, h / 8, w / 8]
+            attention_block,          # [n, 512, h / 8, w / 8]
             ResidualBlock(512, 512),  # [n, 512, h / 8, w / 8]
             ResidualBlock(512, 512),  # [n, 512, h / 8, w / 8]
             ResidualBlock(512, 512),  # [n, 512, h / 8, w / 8]
@@ -370,6 +406,216 @@ def test_decoder():
     outputs = decoder(inputs)
     assert outputs.shape == (4, 3, 224, 224)
     logger.info(str(outputs.shape))
+
+
+class Input(nn.Module):
+    def __init__(self, img_channels=3, img_size=(224, 224)):
+        super().__init__()
+        assert img_channels in (1, 3), (
+            "Either image channels is equal to 3 or equal to 1"
+            f" Never equal to {img_channels}"
+        )
+        self.img_channels = img_channels
+        self.img_size = img_size
+        # self.gray_transform = transforms.Compose([
+        #     transforms.Grayscale(num_output_channels=1),
+        # ])
+
+    def forward(self, x):
+        """
+        Preprocessing method
+        --------------------
+
+        :param x: [batch_size, w, h, img_channels];
+        :returns: [batch_size, img_channels, h, w]
+
+        :type x: torch.Tensor
+        :rtype: torch.Tensor
+        """
+        assert x.shape[-1] in (1, 3), (
+            f"Expected 1 or 3 as image channels, but {x.shape[-1]} is got."
+        )
+        # [batch_size, img_channels, h, w]
+        x = x.permute((0, 3, 2, 1))
+        x = x.contiguous()
+
+        # Resize
+        x = TF.resize(x, self.img_size)
+
+        # RGB, Gray scale conversion
+        if x.shape[1] == 1 and self.img_channels == 3:
+            x = torch.cat([x, x, x], dim=1)
+        elif x.shape[1] == 3 and self.img_channels == 1:
+            x = TF.rgb_to_grayscale(x, num_output_channels=1)
+
+        # Normalization
+        x = x / 255.0
+        return x
+
+
+@dataclass
+class ModelConfig:
+    img_channels = 3
+    img_size = [224, 224]
+    num_groups = 32
+    zch = 8
+    n_heads = 1
+    in_proj_bias = True
+    out_proj_bias = True
+    mult_factor = 0.18215
+
+    def save(self, file_path):
+        data = self.__dict__
+        with open(file_path, mode='w', encoding='utf-8') as f:
+            yaml.dump(data, f)
+
+    def load(self, file_path):
+        with open(file_path, mode='r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+            self.__dict__.update(data)
+
+
+class VAE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config if config else ModelConfig()
+        self.input_function = Input(
+            img_channels=config.img_channels,
+            img_size=config.img_size,
+        )
+        self.encoder = None
+        self.decoder = None
+
+    def init_encoder(self):
+        self.encoder = Encoder(
+            img_channels=self.config.img_channels,
+            num_groups=self.config.num_groups,
+            zch=self.config.zch,
+            n_heads=self.config.n_heads,
+            in_proj_bias=self.config.in_proj_bias,
+            out_proj_bias=self.config.out_proj_bias,
+            mult_factor=self.config.mult_factor,
+        )
+
+    def init_decoder(self):
+        self.decoder = Decoder(
+            img_channels=self.config.img_channels,
+            num_groups=self.config.num_groups,
+            zch=self.config.zch,
+            n_heads=self.config.n_heads,
+            in_proj_bias=self.config.in_proj_bias,
+            out_proj_bias=self.config.out_proj_bias,
+            mult_factor=self.config.mult_factor,
+        )
+
+
+class Model(VAE):
+    def __init__(self, config=None):
+        super().__init__(config)
+
+    def device(self):
+        return next(self.parameters()).device
+
+    def summary(self, batch_size=1):
+        model_device = self.device()
+        img_channels = self.config.img_channels
+        img_size = self.config.img_size
+
+        input_encoder = torch.randn((batch_size, img_channels, *img_size))
+        input_decoder = torch.randn(
+            (batch_size, img_channels, img_size[0] // 8, img_size[1] // 8)
+        )
+        input_encoder = input_encoder.to(model_device)
+        input_decoder = input_decoder.to(model_device)
+        encoder_model_stats = summary(self.encoder, input_data=input_encoder)
+        decoder_model_stats = summary(self.decoder, input_data=input_decoder)
+        return encoder_model_stats, decoder_model_stats
+
+    def save_encoder(self, file_path):
+        """
+        Function to save encoder model weights into file.
+
+        :params file_path: The model file path.
+        :type file_path: `str`
+        """
+        os.makedirs(file_path, exist_ok=True)
+        model_file = os.path.join(file_path, 'weights.pth')
+        param_file = os.path.join(file_path, 'config.yaml')
+
+        model_weights = self.encoder.state_dict()
+        torch.save(model_weights, model_file)
+        self.config.save(param_file)
+
+    def save_decoder(self, file_path):
+        """
+        Function to save decoder model weights into file.
+
+        :params file_path: The model file path.
+        :type file_path: `str`
+        """
+        os.makedirs(file_path, exist_ok=True)
+        model_file = os.path.join(file_path, 'weights.pth')
+        param_file = os.path.join(file_path, 'config.yaml')
+
+        model_weights = self.decoder.state_dict()
+        torch.save(model_weights, model_file)
+        self.config.save(param_file)
+
+    def load_encoder(self, file_path):
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"No such saved model file at {file_path}")
+        model_file = os.path.join(file_path, 'weights.pth')
+        param_file = os.path.join(file_path, 'config.yaml')
+        if not os.path.isfile(param_file):
+            raise FileNotFoundError(
+                f"No such model config file at {param_file}.")
+        if not os.path.isfile(model_file):
+            raise FileNotFoundError(f"No such model file at {model_file}.")
+        hparams = ModelConfig()
+        hparams.load(param_file)
+        instance = cls(hparams)
+        weights = torch.load(
+            model_file, weights_only=True, map_location='cpu')
+        instance.load_state_dict(weights)
+        logger.info("Model weights loaded successfully!")
+        return instance
+
+
+
+###############################################################################
+# DATASET IMPLEMENTATION
+###############################################################################
+
+class Dataset(BaseDataset):
+    def __init__(self, dataset_dir, augment=False):
+        self.dataset_dir = dataset_dir
+        self.augment = augment
+
+        self.image_files = []
+        self.load_image_files()
+
+    def load_image_files(self):
+        """
+        Method to load image files from dataset directory provided
+        """
+        for root, _, files in os.walk(self.dataset_dir):
+            for file in files:
+                if not file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    continue
+                file = os.path.join(root, file)
+                self.image_files.append(file)
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, item):
+        image_file = self.image_files[item]
+
+        image = Image.open(image_file)
+        image = image.convert('RGB')
+        image = np.asarray(image, dtype=np.uint8)
+        image = torch.tensor(image)
+        return image
 
 
 def main():
