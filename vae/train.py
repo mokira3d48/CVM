@@ -480,11 +480,14 @@ class VAE(nn.Module):
         super().__init__()
         self.config = config if config else ModelConfig()
         self.input_function = Input(
-            img_channels=config.img_channels,
-            img_size=config.img_size,
+            img_channels=self.config.img_channels,
+            img_size=self.config.img_size,
         )
         self.encoder = None
         self.decoder = None
+
+        self.init_encoder()
+        self.init_decoder()
 
     def init_encoder(self):
         self.encoder = Encoder(
@@ -509,6 +512,28 @@ class VAE(nn.Module):
         )
 
 
+def load_module(file_path, module, map_location='cpu'):
+    """
+    Function to load state dict from file
+
+    :param file_path: The file path where the module state dict is stored;
+    :param module: The module whose state dict we want to load;
+    :param map_location: The device name where we want to load state dict;
+    :returns: The instance of module with state dict loaded.
+
+    :type file_path: `str`
+    :type module: torch.nn.Module
+    :type map_location: `str`
+    :rtype: torch.nn.Module
+    """
+    weights = torch.load(
+        file_path, weights_only=True, map_location=map_location
+    )
+    module.load_state_dict(weights)
+    logger.info(f"Model weights of {module.__name__} loaded successfully!")
+    return module
+
+
 class Model(VAE):
     def __init__(self, config=None):
         super().__init__(config)
@@ -517,6 +542,13 @@ class Model(VAE):
         return next(self.parameters()).device
 
     def summary(self, batch_size=1):
+        """
+        Function to summary
+
+        :param batch_size: The batch size that is used to print
+          model architecture
+        :type batch_size: int
+        """
         model_device = self.device()
         img_channels = self.config.img_channels
         img_size = self.config.img_size
@@ -561,25 +593,56 @@ class Model(VAE):
         torch.save(model_weights, model_file)
         self.config.save(param_file)
 
-    def load_encoder(self, file_path):
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"No such saved model file at {file_path}")
-        model_file = os.path.join(file_path, 'weights.pth')
-        param_file = os.path.join(file_path, 'config.yaml')
-        if not os.path.isfile(param_file):
-            raise FileNotFoundError(
-                f"No such model config file at {param_file}.")
-        if not os.path.isfile(model_file):
-            raise FileNotFoundError(f"No such model file at {model_file}.")
-        hparams = ModelConfig()
-        hparams.load(param_file)
-        instance = cls(hparams)
-        weights = torch.load(
-            model_file, weights_only=True, map_location='cpu')
-        instance.load_state_dict(weights)
-        logger.info("Model weights loaded successfully!")
+    @classmethod
+    def load(cls, encoder_fp=None, decoder_fp=None):
+        """
+        Class method to load encoder and decoder model weights from files
+
+        :param encoder_fp: The file path where the encoder model is saved;
+        :param decoder_fp: The file path where the decoder model is saved;
+        :returns: The instance of VAE model.
+
+        :type encoder_fp: `str`
+        :type decoder_fp: `str`
+        :rtype: Model
+        """
+        instance = None
+        model_config = None
+
+        if encoder_fp:
+            config_file = os.path.join(encoder_fp, 'config.yaml')
+            model_config = ModelConfig()
+            model_config.load(config_file)
+
+        if decoder_fp:
+            config_file = os.path.join(decoder_fp, 'config.yaml')
+            model_config = ModelConfig()
+            model_config.load(config_file)
+
+        if model_config:
+            instance = cls(model_config)
+            if encoder_fp:
+                model_file = os.path.join(encoder_fp, 'weights.pth')
+                instance.encoder = load_module(model_file, instance.encoder)
+            if decoder_fp:
+                model_file = os.path.join(decoder_fp, 'weights.pth')
+                instance.decoder = load_module(model_file, instance.decoder)
         return instance
 
+
+def test_model_save_load():
+    instance = Model()
+    instance.save_encoder("encoder_file")
+    instance.save_decoder("decoder_file")
+
+    assert os.path.isdir("encoder_file") == True
+    assert os.path.isfile("encoder_file/config.yaml")
+    assert os.path.isfile("encoder_file/weights.pth")
+    assert os.path.isdir("decoder_file") == True
+    assert os.path.isfile("decoder_file/config.yaml")
+    assert os.path.isfile("decoder_file/weights.pth")
+
+    # Load encoder and decoder from file
 
 
 ###############################################################################
