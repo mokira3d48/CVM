@@ -1170,8 +1170,6 @@ class Trainer(Model):
 
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
-            logger.info("-")
-            logger.info("-")
             logger.info(f'Epoch: {epoch + 1} / {self.num_epochs}:')
 
             train_losses = self.train_one_epoch()
@@ -1199,7 +1197,7 @@ class Trainer(Model):
 
             if epoch != (self.num_epochs - 1):
                 # Epochs are remaining
-                logger.info("-" * 80)
+                logger.info(("-" * 80) + "\n")
 
         self.save_encoder("vae_encoder")
         self.save_decoder("vae_decoder")
