@@ -31,14 +31,14 @@ import torchvision.transforms.functional as TF
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    # format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("vae_train.log"),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def set_seed(seed=42):
@@ -461,6 +461,7 @@ class Input(nn.Module):
         # Normalization
         # x = x / 255.0
         # TF.normalize()
+        x = x.to(torch.float32)
         return x
 
 
@@ -744,7 +745,8 @@ class Dataset(BaseDataset):
                 self.image_files.append(file)
 
     def __len__(self):
-        return len(self.image_files)
+        return 480  # For an example
+        # return len(self.image_files)
 
     def __getitem__(self, item):
         image_file = self.image_files[item]
@@ -977,7 +979,7 @@ class Trainer(Model):
 
     def checkpoint(self, **kwargs):
         checkpoint = {
-            "model_config": self.config.__dict__,
+            "model_config": self.config.data(),
             "encoder_model_state_dict": self.encoder.state_dict(),
             "decoder_model_state_dict": self.decoder.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -1045,7 +1047,7 @@ class Trainer(Model):
             self.optimizer.zero_grad()
 
             write_fn(
-                "Optim step"
+                "\tOptim step"
                 f" - reconstruction loss: {self.recon_loss.avg():.8f}"
                 f" - KL loss: {self.kl_loss.avg():.8f}")
             self.gac = 0
@@ -1057,8 +1059,11 @@ class Trainer(Model):
         model_device = self.device()
         loss_data = {}
 
+        self.recon_loss.reset()
+        self.kl_loss.reset()
+
         length = len(self.train_loader)
-        iterator = tqdm(self.train_loader, desc="train")
+        iterator = tqdm(self.train_loader, desc="\tTRAINING")
         write_fn = iterator.write
 
         self.train()
@@ -1091,7 +1096,7 @@ class Trainer(Model):
 
         self.eval()
         with torch.no_grad():
-            iterator = tqdm(self.val_loader, desc="val")
+            iterator = tqdm(self.val_loader, desc="\tVALIDATION")
 
             for images, targets in iterator:
                 images = images.to(model_device)  # noqa
@@ -1238,9 +1243,9 @@ def main():
     if not model:
         config = ModelConfig()
         config.img_channels = args.img_channels
-        config.img_size = args.img_size
+        config.img_size = (args.img_size, args.img_size)
         config.num_groups = args.num_groups
-        config.zch = args.zch
+        config.zch = args.z_ch
         config.n_heads = args.n_heads
         config.in_proj_bias = args.in_proj_bias
         config.out_proj_bias = args.out_proj_bias
