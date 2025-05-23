@@ -1,6 +1,35 @@
 #!/bin/env python3
 # -*- encoding: utf-8 -*-
 
+"""
+===============================================================================
+|                        VAE TRAINING IMPLEMENTATION                          |
+===============================================================================
+
+
+MIT License
+
+Copyright (c) 2025 Dr Mokira
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
 __version__ = '0.1.0'
 __author__ = 'Dr Mokira'
 
@@ -745,8 +774,8 @@ class Dataset(BaseDataset):
                 self.image_files.append(file)
 
     def __len__(self):
-        return 480  # For an example
-        # return len(self.image_files)
+        # return 72  # For an example
+        return len(self.image_files)
 
     def __getitem__(self, item):
         image_file = self.image_files[item]
@@ -1047,7 +1076,7 @@ class Trainer(Model):
             self.optimizer.zero_grad()
 
             write_fn(
-                "\tOptim step"
+                "\t* Optim step"
                 f" - reconstruction loss: {self.recon_loss.avg():.8f}"
                 f" - KL loss: {self.kl_loss.avg():.8f}")
             self.gac = 0
@@ -1063,7 +1092,8 @@ class Trainer(Model):
         self.kl_loss.reset()
 
         length = len(self.train_loader)
-        iterator = tqdm(self.train_loader, desc="\tTRAINING")
+        desc = "\033[44m    TRAINING\033[0m"
+        iterator = tqdm(self.train_loader, desc=desc)
         write_fn = iterator.write
 
         self.train()
@@ -1096,7 +1126,8 @@ class Trainer(Model):
 
         self.eval()
         with torch.no_grad():
-            iterator = tqdm(self.val_loader, desc="\tVALIDATION")
+            desc = "\033[43m    VALIDATION\033[0m"
+            iterator = tqdm(self.val_loader, desc=desc)
 
             for images, targets in iterator:
                 images = images.to(model_device)  # noqa
