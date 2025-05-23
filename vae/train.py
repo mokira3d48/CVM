@@ -38,12 +38,15 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def set_seed(seed=42):
     """
     Setting the seed for all the random generator
+
+    :param seed: An integer value;
+    :type seed: int
     """
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -316,10 +319,11 @@ class Encoder(nn.Sequential):
         x = mean + eps * std
 
         out = x * self.mult_factor
-        return out
+        return out, (mean, log_variance)
 
 
 def test_encoder():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     encoder = Encoder(img_channels=3)
     encoder = encoder.to(device)
 
@@ -328,7 +332,7 @@ def test_encoder():
     summary(encoder, input_data=inputs)
 
     inputs = torch.randn((4, 3, 224, 224))
-    outputs = encoder(inputs)
+    outputs, _ = encoder(inputs)
     assert outputs.shape == (4, 4, 28, 28)
     logger.info(str(outputs.shape))
 
@@ -398,6 +402,7 @@ class Decoder(nn.Sequential):
 
 
 def test_decoder():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     decoder = Decoder(img_channels=3)
     decoder = decoder.to(device)
 
@@ -448,11 +453,42 @@ class Input(nn.Module):
         # RGB, Gray scale conversion
         if x.shape[1] == 1 and self.img_channels == 3:
             x = torch.cat([x, x, x], dim=1)
+            x = TF.normalize(x, [0.5]*3, [0.5]*3)
         elif x.shape[1] == 3 and self.img_channels == 1:
             x = TF.rgb_to_grayscale(x, num_output_channels=1)
+            x = TF.normalize(x, [0.5], [0.5])
 
         # Normalization
-        x = x / 255.0
+        # x = x / 255.0
+        # TF.normalize()
+        return x
+
+
+class Output(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        """
+        Post-processing method
+        ----------------------
+
+        :param x: [batch_size, img_channels, h, w];
+        :returns: [batch_size, w, h, img_channels]
+
+        :type x: torch.Tensor
+        :rtype: torch.Tensor
+        """
+        if x.shape[1] == 1:
+            x = torch.cat([x, x, x], dim=1)
+
+        # [batch_size, img_channels, h, w]
+        x = x.permute((0, 3, 2, 1))
+        x = x.contiguous()
+
+        # DeNormalization
+        x = x * 255.0
+        x = x.to(torch.uint8)
         return x
 
 
@@ -510,8 +546,7 @@ class VAE(nn.Module):
             n_heads=self.config.n_heads,
             in_proj_bias=self.config.in_proj_bias,
             out_proj_bias=self.config.out_proj_bias,
-            mult_factor=self.config.mult_factor,
-        )
+            mult_factor=self.config.mult_factor)
 
     def init_decoder(self):
         self.decoder = Decoder(
@@ -521,8 +556,25 @@ class VAE(nn.Module):
             n_heads=self.config.n_heads,
             in_proj_bias=self.config.in_proj_bias,
             out_proj_bias=self.config.out_proj_bias,
-            mult_factor=self.config.mult_factor,
-        )
+            mult_factor=self.config.mult_factor)
+
+    def forward(self, x):
+        """
+        Forward pass
+        ------------
+
+        :param x: An image with [batch_size, img_channels, h, w];
+        :returns:
+          - Reconstructed image with [batch_size, img_channels, h, w];
+          - Latent representation: [batch_size, zch/2, h/8, w/8]
+          - mean, log_variance: [batch_size, zch/2, h/8, w/8]
+
+        :type x: torch.Tensor
+        :rtype: tuple
+        """
+        encoded, (mean, log_variance) = self.encoder(x)
+        reconstructed = self.decoder(encoded)
+        return reconstructed, encoded, (mean, log_variance)
 
 
 def load_module(file_path, module, map_location='cpu'):
@@ -742,6 +794,29 @@ class AvgMeter:
         return str(self.total)
 
 
+class KLDiv(nn.Module):
+    def __init__(self, beta=0.00025):
+        super().__init__()
+        self.beta = beta
+
+    def forward(self, mean, log_variance):
+        """
+        Compute KL divergence
+
+        :param mean: The mean value;
+        :param log_variance: The log variance value;
+        :returns: Le value (scalar) of KL divergence computed
+
+        :type mean: torch.Tensor
+        :type log_variance: torch.Tensor
+        :rtype: torch.Tensor
+        """
+        x = torch.sum(1 + log_variance - mean.pow(2) - log_variance.exp())
+        kl_divergence = -0.5 * x
+        output = self.beta * kl_divergence
+        return output
+
+
 class Trainer(Model):
     """
     Training model
@@ -798,18 +873,15 @@ class Trainer(Model):
         self.train_loader = None
         self.val_loader = None
 
+        self.mse_loss = None
+        self.kl_div = None
         self.optimizer = None
         self.lr_scheduler = None
 
         self.train_losses = {}
         self.val_losses = {}
-        self.loss_classifier = AvgMeter()
-        self.loss_box_reg = AvgMeter()
-
-        self.inference_store = None
-        self.mAP50 = None
-        self.mAP75 = None
-        self.mAP95 = None
+        self.recon_loss = AvgMeter()
+        self.kl_loss = AvgMeter()
 
         self.gas = 128  # Gradiant Accumulation Steps
         self.seed = 42  # Seed number for random generation
@@ -839,19 +911,14 @@ class Trainer(Model):
         self.batch_size = args.batch_size
         self.gas = args.gas
 
-        dataset_dir = args.dataset_dir
-        train_ds_dir = os.path.join(dataset_dir, 'train')
-        val_ds_dir = os.path.join(dataset_dir, 'val')
-        ds_config_file = os.path.join(dataset_dir, 'data.yaml')
+        train_ds_dir = args.train_ds_dir
+        val_ds_dir = args.val_ds_dir
         if not os.path.isdir(train_ds_dir):
             raise FileNotFoundError(
                 f"No such training set directory at {train_ds_dir}")
         if not os.path.isdir(val_ds_dir):
             raise FileNotFoundError(
                 f"No such validation set directory at {val_ds_dir}")
-        if not os.path.isfile(ds_config_file):
-            raise FileNotFoundError(
-                f"No such dataset config file at {ds_config_file}")
         train_dataset = Dataset(train_ds_dir)
         val_dataset = Dataset(val_ds_dir)
 
@@ -860,6 +927,10 @@ class Trainer(Model):
             train_dataset, batch_size=args.batch_size, shuffle=True)
         self.val_loader = data.DataLoader(
             val_dataset, batch_size=args.batch_size, shuffle=False)
+
+        # Set loss function
+        self.mse_loss = nn.MSELoss()
+        self.kl_div = KLDiv(beta=args.kl_weight)
 
         # Set up the optimizer
         self.optimizer = torch.optim.AdamW(
@@ -953,11 +1024,20 @@ class Trainer(Model):
         """
         Training method on one batch
         """
-        # Forward pass and loss compute
-        reconstructed_image = self.forward(images)
+        # Forward pass
+        encoded, (mean, log_variance) = self.encoder(images)
+        reconstructed_image = self.decoder(encoded)
+
+        # Comput losses
+        reconstructed_loss = self.mse_loss(reconstructed_image, targets)
+        kl_divergence = self.kl_div(mean, log_variance)
+        loss = reconstructed_loss + kl_divergence
 
         # Backward pass
         loss.backward()
+
+        self.recon_loss += reconstructed_loss.item()
+        self.kl_loss += kl_divergence.item()
 
         self.gac += len(images)
         if self.gac >= self.gas or optimize:
@@ -966,10 +1046,8 @@ class Trainer(Model):
 
             write_fn(
                 "Optim step"
-                f" - loss classifier: {self.loss_classifier.avg():.8f}"
-                f" - loss box reg: {self.loss_box_reg.avg():.8f}"
-                f" - loss objectness: {self.loss_objectness.avg():.8f}"
-                f" - loss rpn box reg: {self.loss_rpn_box_reg.avg():.8f}")
+                f" - reconstruction loss: {self.recon_loss.avg():.8f}"
+                f" - KL loss: {self.kl_loss.avg():.8f}")
             self.gac = 0
 
     def train_one_epoch(self):
@@ -989,23 +1067,27 @@ class Trainer(Model):
             images = images.to(model_device)  # noqa
             targets = targets.to(model_device)
 
+            images = self.input_function(images)
+            targets = self.input_function(targets)
+
             # At last iteration, the gradient accumulation count can not
             # be equal to gradient accumulation step, so we must perform
             # optimization step when we are at the last iteration (length - 1)
-            last_index = index >= (length - 1)
-            self.train_step(images, targets, write_fn, last_index)
+            is_last_index = index >= (length - 1)
+            self.train_step(images, targets, write_fn, is_last_index)
 
-            # loss_data = {
-            #     "loss_classifier": self.loss_classifier.avg(),
-            #     "loss_box_reg": self.loss_box_reg.avg(),
-            #     "loss_objectness": self.loss_objectness.avg(),
-            #     "loss_rpn_box_reg": self.loss_rpn_box_reg.avg()}
-            # iterator.set_postfix(loss_data)
+            loss_data = {
+                "recon_loss": self.recon_loss.avg(),
+                "kl_loss": self.kl_loss.avg()}
+            iterator.set_postfix(loss_data)
 
         return loss_data
 
     def validate(self):
         model_device = self.device()
+        loss_data = {}
+        self.recon_loss.reset()
+        self.kl_loss.reset()
 
         self.eval()
         with torch.no_grad():
@@ -1015,10 +1097,27 @@ class Trainer(Model):
                 images = images.to(model_device)  # noqa
                 targets = targets.to(model_device)
 
-                # Forward pass
-                reconstructed_image = self.forward(images)
+                images = self.input_function(images)
+                targets = self.input_function(targets)
 
-        return {}
+                # Forward pass
+                encoded, (mean, log_variance) = self.encoder(images)
+                reconstructed_image = self.decoder(encoded)
+
+                # Compute losses
+                reconstructed_loss = self.mse_loss(
+                    reconstructed_image, targets)
+                kl_divergence = self.kl_div(mean, log_variance)
+
+                self.recon_loss += reconstructed_loss.item()
+                self.kl_loss += kl_divergence.item()
+
+                loss_data.update({
+                    "recon_loss": self.recon_loss.avg(),
+                    "kl_loss": self.kl_loss.avg()})
+                iterator.set_postfix(loss_data)
+
+        return loss_data
 
     def fit(self):
         """
@@ -1035,7 +1134,9 @@ class Trainer(Model):
 
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
-            logger.info(f'Epoch: {epoch + 1} / {self.num_epochs}:\n')
+            logger.info("-")
+            logger.info("-")
+            logger.info(f'Epoch: {epoch + 1} / {self.num_epochs}:')
 
             train_losses = self.train_one_epoch()
 
@@ -1064,27 +1165,51 @@ class Trainer(Model):
                 # Epochs are remaining
                 logger.info("-" * 80)
 
+        self.save_encoder("vae_encoder")
+        self.save_decoder("vae_decoder")
+        logger.info(
+            "VAE encoder and decoder are saved at 'vae_encoder'"
+            " and 'vae_decoder' respectively.")
+
 
 def parse_argument():
     """
     Command line argument parsing
     """
-    parser = ArgumentParser(prog="ResNet FasterRCNN FPN v2 Train")
+    parser = ArgumentParser(prog="VAE Train")
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('-d', '--dataset-dir', type=str, required=True)
+    parser.add_argument('-dt', '--train-ds-dir', type=str, required=True)
+    parser.add_argument('-dv', '--val-ds-dir', type=str, required=True)
     parser.add_argument('-b', '--batch-size', type=int, default=1)
 
-    parser.add_argument('--image-size', type=int, default=224)
+    # img_channels = 3
+    # img_size = [224, 224]
+    # num_groups = 32
+    # zch = 8
+    # n_heads = 1
+    # in_proj_bias = True
+    # out_proj_bias = True
+    # mult_factor = 0.18215
+
+    parser.add_argument('--img-channels', type=int, default=3)
+    parser.add_argument('--img-size', type=int, default=224)
+    parser.add_argument('--num-groups', type=int, default=32)
+    parser.add_argument('--z-ch', type=int, default=8)
+    parser.add_argument('--n-heads', type=int, default=1)
+    parser.add_argument('--in-proj-bias', type=bool, default=True)
+    parser.add_argument('--out-proj-bias', type=bool, default=True)
+    parser.add_argument('--mult-factor', type=float, default=0.18215)
 
     parser.add_argument('-n', '--epochs', type=int, default=2)
     parser.add_argument('-lr', '--learning-rate', type=float, default=1e-4)
     parser.add_argument('--weight-decay', type=float, default=0.0005)
+    parser.add_argument('-kl-weight', type=float, default=0.00025)
     parser.add_argument('-gas', type=int, default=128)
 
     parser.add_argument('-r', "--resume", type=str)
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
-    parser.add_argument('--encoder-model', type=str)
-    parser.add_argument('--decoder-model', type=str)
+    parser.add_argument('--encoder-model', type=str, help="Encoder model")
+    parser.add_argument('--decoder-model', type=str, help="Decoder model")
     parser.add_argument('--best-model', type=str, default="best")
 
     args = parser.parse_args()
@@ -1099,33 +1224,30 @@ def main():
     Main function to run train process
     """
     args = parse_argument()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    set_seed(args.seed)
 
-    model_file = args.model_file
+    encoder_file = args.encoder_model
+    decoder_file = args.decoder_model
     checkpoint = args.resume
     model = None
     if checkpoint:
         model = Trainer.load(checkpoint_file=checkpoint)
-    if not model and model_file:
-        model = Trainer.load(model_file)
+    if not model and encoder_file and decoder_file:
+        model = Trainer.load(encoder_file, decoder_file)
     if not model:
-        hparams = Trainer.Config()
-        hparams.backbone = args.backbone
-        hparams.im_size = args.image_size
+        config = ModelConfig()
+        config.img_channels = args.img_channels
+        config.img_size = args.img_size
+        config.num_groups = args.num_groups
+        config.zch = args.zch
+        config.n_heads = args.n_heads
+        config.in_proj_bias = args.in_proj_bias
+        config.out_proj_bias = args.out_proj_bias
+        config.mult_factor = args.mult_factor
 
-        # Open dataset config
-        # and get number of class names
-        ds_config_file = os.path.join(args.dataset_dir, 'data.yaml')
-        if not os.path.isfile(ds_config_file):
-            logger.error(f"No such config file at {ds_config_file}")
-            exit(2)
-        with open(ds_config_file, mode='r', encoding='utf-8') as file:
-            config = yaml.safe_load(file)
-            nc = len(config['names'])
-            hparams.num_classes = nc
+        model = Trainer(config)
 
-        model = Trainer(hparams)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
 
     model.compile(args)
