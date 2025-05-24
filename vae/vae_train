@@ -1,0 +1,7 @@
+#!/bin/bash
+venv/bin/python3 train.py -n 1000 -b 16 -gas 256 -lr 1e-5 \
+	--img-size 112 --img-channels 3 -z-ch 16 \
+	-dt "dataset/train" \
+	-dv "dataset/val" \
+	--checkpoint-dir "license_plate_vae" \
+	-r "license_plate_vae/checkpoint.pth"

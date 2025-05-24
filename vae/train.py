@@ -477,7 +477,8 @@ class Input(nn.Module):
         x = x.contiguous()
 
         # Resize
-        x = TF.resize(x, self.img_size)
+        if x.shape[-2:] != self.img_size:
+            x = TF.resize(x, self.img_size)
 
         # RGB, Gray scale conversion
         if x.shape[1] == 1 and self.img_channels == 3:
@@ -488,8 +489,7 @@ class Input(nn.Module):
             x = TF.normalize(x, [0.5], [0.5])
 
         # Normalization
-        # x = x / 255.0
-        # TF.normalize()
+        x = x / 255.0
         x = x.to(torch.float32)
         return x
 
@@ -755,8 +755,9 @@ def test_model_save_load():
 ###############################################################################
 
 class Dataset(BaseDataset):
-    def __init__(self, dataset_dir, augment=False):
+    def __init__(self, dataset_dir, img_size=(224, 224), augment=None):
         self.dataset_dir = dataset_dir
+        self.img_size = img_size
         self.augment = augment
 
         self.image_files = []
@@ -782,9 +783,17 @@ class Dataset(BaseDataset):
 
         image = Image.open(image_file)
         image = image.convert('RGB')
+        image = image.resize(self.img_size)
+
         image = np.asarray(image, dtype=np.uint8)
-        input_image = torch.tensor(image)
-        output_image = torch.tensor(image)
+        image = torch.tensor(image)
+
+        input_image = image.clone()
+        if self.augment:
+            # Transform input_image, comming soom!
+            ...
+
+        output_image = image.clone()
         return input_image, output_image
 
 
@@ -950,8 +959,8 @@ class Trainer(Model):
         if not os.path.isdir(val_ds_dir):
             raise FileNotFoundError(
                 f"No such validation set directory at {val_ds_dir}")
-        train_dataset = Dataset(train_ds_dir)
-        val_dataset = Dataset(val_ds_dir)
+        train_dataset = Dataset(train_ds_dir, img_size=self.config.img_size)
+        val_dataset = Dataset(val_ds_dir, img_size=self.config.img_size)
 
         # Create data loaders
         self.train_loader = data.DataLoader(
@@ -1165,6 +1174,10 @@ class Trainer(Model):
 
         :rtype: `dict`
         """
+        model_device = self.device()
+        device_to_str = str(model_device).upper()
+        logger.info(f"MODEL DEVICE SELECTED: \033[92m{device_to_str}\033[0m")
+
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.load_checkpoint()
 
