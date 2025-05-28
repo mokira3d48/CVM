@@ -1,0 +1,7 @@
+#!/bin/bash
+python vae/fine_tuning.py -n 100 -b 16 -gas 128 \
+  --bottleneck "fc1layer" --num-classes 36 \
+  -dt "dataset/train" \
+  -dv "dataset/val" \
+  --checkpoint "plate_digits" -r "plate_digits/checkpoint.pth" \
+  --backbone-model "outputs/plate_digit_encoder"
