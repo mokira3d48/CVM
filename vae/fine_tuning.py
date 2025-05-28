@@ -51,7 +51,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from PIL import Image
-from sklearn.metrics import confusion_matrix, classification_report
+# from sklearn.metrics import confusion_matrix, classification_report
+from sklearn import metrics as m
 
 import torch
 import torch.nn.functional as F
@@ -494,9 +495,8 @@ class FC3Layer(nn.Module):
         self.dropout_prob = dropout_prob
 
         self.input = nn.Linear(self.in_features, self.hidden_dims)
-        self.dropout1 = nn.Dropout(p=self.dropout_prob)
+        self.dropout = nn.Dropout(p=self.dropout_prob)
         self.hidden = nn.Linear(self.hidden_dims, self.hidden_dims)
-        self.dropout2 = nn.Dropout(p=self.dropout_prob)
         self.output = nn.Linear(self.hidden_dims, self.num_classes)
 
     def forward(self, x):
@@ -512,10 +512,9 @@ class FC3Layer(nn.Module):
         """
         x = self.input(x)
         x = F.relu(x)
-        x = self.dropout1(x)
+        x = self.dropout(x)
         x = self.hidden(x)
         x = F.relu(x)
-        x = self.dropout2(x)
         out = self.output(x)
         return out
 
@@ -586,10 +585,19 @@ class Output(nn.Module):
         :type x: torch.Tensor
         :rtype: tuple of torch.Tensor
         """
-        probs = torch.log_softmax(x, dim=-1)  # [n, num_classes]
+        probs = torch.softmax(x, dim=-1)  # [n, num_classes]
         class_ids = torch.argmax(probs, dim=-1)  # [n,]
-        confidences = torch.max(probs, dim=-1)  # [n,]
+        confidences = torch.max(probs, dim=-1).values  # [n,]
         return class_ids, confidences
+
+
+def test_output():
+    output = Output()
+    logits = torch.randn(2, 10)
+    preds = output(logits)
+    print("logits", logits)
+    print(preds[0])
+    print(preds[1])
 
 
 class ModelConfig(BaseConfig):
@@ -635,6 +643,7 @@ class VAEncoderFT(nn.Module):
         img_channels = self.config.backbone_config.img_channels
         img_size = self.config.backbone_config.img_size
         self.input = Input(img_channels=img_channels, img_size=img_size)
+        self.output = Output()
 
         self.backbone = Backbone(self.config.backbone_config)
 
@@ -927,6 +936,9 @@ class Trainer(Model):
         self.train_losses = {}
         self.val_losses = {}
         self.cross_entropy_loss = AvgMeter()
+        self.precision_score = AvgMeter()
+        self.recall_score = AvgMeter()
+        self.f1_score = AvgMeter()
 
         self.gas = 128  # Gradiant Accumulation Steps
         self.seed = 42  # Seed number for random generation
@@ -958,14 +970,15 @@ class Trainer(Model):
 
         train_ds_dir = args.train_ds_dir
         val_ds_dir = args.val_ds_dir
+        img_size = self.config.backbone_config.img_size
         if not os.path.isdir(train_ds_dir):
             raise FileNotFoundError(
                 f"No such training set directory at {train_ds_dir}")
         if not os.path.isdir(val_ds_dir):
             raise FileNotFoundError(
                 f"No such validation set directory at {val_ds_dir}")
-        train_dataset = Dataset(train_ds_dir)
-        val_dataset = Dataset(val_ds_dir)
+        train_dataset = Dataset(train_ds_dir, img_size=img_size)
+        val_dataset = Dataset(val_ds_dir, img_size=img_size)
 
         # Create data loaders
         self.train_loader = data.DataLoader(
@@ -1068,15 +1081,34 @@ class Trainer(Model):
         Training method on one batch
         """
         # Forward pass
-        outputs = self.forward(images)
+        images = self.input(images)
+        logits = self.forward(images)
+        predictions, _ = self.output(logits)
+        # print("-------------", predictions)
+        # exit(0)
 
         # Comput losses
-        loss = self.cross_entropy(outputs, targets)
+        loss = self.cross_entropy(logits, targets)
 
         # Backward pass
         loss.backward()
 
         self.cross_entropy_loss += loss.item()
+
+        y_true = targets.cpu().detach().numpy()
+        y_pred = predictions.cpu().detach().numpy()
+
+        # Compute metrics
+        args = dict(
+            y_true=y_true, y_pred=y_pred, average='macro', zero_division=0)
+        precision = m.precision_score(**args)
+        recall = m.recall_score(**args)
+        f1 = m.f1_score(**args)
+
+        self.cross_entropy_loss += loss.item()
+        self.precision_score += precision
+        self.recall_score += recall
+        self.f1_score += f1
 
         self.gac += len(images)
         if self.gac >= self.gas or optimize:
@@ -1085,7 +1117,10 @@ class Trainer(Model):
 
             write_fn(
                 "\t* Optim step"
-                f" - cross_entropy loss: {self.cross_entropy_loss.avg():.8f}")
+                f" - cross_entropy loss: {self.cross_entropy_loss.avg():.8f}"
+                f" - precision score: {self.precision_score.avg():5.3f}"
+                f" - recall score: {self.recall_score.avg():5.3f}"
+                f" - f1 score: {self.f1_score.avg():5.3f}")
             self.gac = 0
 
     def train_one_epoch(self):
@@ -1096,6 +1131,9 @@ class Trainer(Model):
         loss_data = {}
 
         self.cross_entropy_loss.reset()
+        self.precision_score.reset()
+        self.recall_score.reset()
+        self.f1_score.reset()
 
         length = len(self.train_loader)
         desc = "\033[44m    TRAINING\033[0m"
@@ -1108,8 +1146,6 @@ class Trainer(Model):
             images = images.to(model_device)  # noqa
             targets = targets.to(model_device)
 
-            images = self.input(images)
-
             # At last iteration, the gradient accumulation count can not
             # be equal to gradient accumulation step, so we must perform
             # optimization step when we are at the last iteration (length - 1)
@@ -1117,7 +1153,10 @@ class Trainer(Model):
             self.train_step(images, targets, write_fn, is_last_index)
 
             loss_data = {
-                "cross_entropy_loss": self.cross_entropy_loss.avg()}
+                "cross_entropy_loss": self.cross_entropy_loss.avg(),
+                "precision": self.precision_score.avg(),
+                "recall": self.recall_score.avg(),
+                "f1": self.f1_score.avg()}
             iterator.set_postfix(loss_data)
 
         return loss_data
@@ -1126,6 +1165,9 @@ class Trainer(Model):
         model_device = self.device()
         loss_data = {}
         self.cross_entropy_loss.reset()
+        self.precision_score.reset()
+        self.recall_score.reset()
+        self.f1_score.reset()
 
         self.eval()
         with torch.no_grad():
@@ -1136,18 +1178,35 @@ class Trainer(Model):
                 images = images.to(model_device)  # noqa
                 targets = targets.to(model_device)
 
-                images = self.input(images)
-
                 # Forward pass
-                outputs = self.forward(images)
+                images = self.input(images)
+                logits = self.forward(images)
+                predictions, _ = self.output(logits)
 
                 # Comput losses
-                loss = self.cross_entropy(outputs, targets)
+                loss = self.cross_entropy(logits, targets)
+
+                y_true = targets.cpu().detach().numpy()
+                y_pred = predictions.cpu().detach().numpy()
+
+                # Compute metrics
+                args = dict(
+                    y_true=y_true, y_pred=y_pred, average='macro',
+                    zero_division=0)
+                precision = m.precision_score(**args)
+                recall = m.recall_score(**args)
+                f1 = m.f1_score(**args)
 
                 self.cross_entropy_loss += loss.item()
+                self.precision_score += precision
+                self.recall_score += recall
+                self.f1_score += f1
 
                 loss_data.update({
-                    "cross_entropy": self.cross_entropy_loss.avg()})
+                    "cross_entropy": self.cross_entropy_loss.avg(),
+                    "precision": self.precision_score.avg(),
+                    "recall": self.recall_score.avg(),
+                    "f1": self.f1_score.avg()})
                 iterator.set_postfix(loss_data)
 
         return loss_data
