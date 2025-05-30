@@ -1,7 +1,7 @@
 # -*- encoding: utf-8 -*-
 
 __version__ = '0.1.0'
-__author__ = 'Arnold Mokira'
+__author__ = 'Dr Mokira'
 
 import os
 import math
@@ -313,10 +313,10 @@ class DFL(nn.Module):
     coordinates (x, y, w, h). For example, to predict coordinate
     x in the normalized range [0, 1]:
 
-    1. DFL uses 16 bins which are equally spaced in [0, 1] bin length 1/16.
-    2. The model outputs 16 numbers which corresponds to probabilities
+      1. DFL uses 16 bins which are equally spaced in [0, 1] bin length 1/16.
+      2. The model outputs 16 numbers which corresponds to probabilities
         that x falls in these bins, for example, [0, 0, ..., 9/10, 1/10].
-    3. Prediction for x = mean value = 9/10 x 1/16 + 1/10 x 1 = 0.94375.
+      3. Prediction for x = mean value = 9/10 x 1/16 + 1/10 x 1 = 0.94375.
     """
     def __init__(self, ch=16):
         super().__init__()
