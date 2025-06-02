@@ -34,7 +34,10 @@ __version__ = '0.1.0'
 __author__ = 'Dr Mokira'
 
 import os
+import sys
 import logging
+import traceback
+import argparse
 
 import torch
 import torch.nn.functional as F
@@ -44,17 +47,74 @@ from torch.utils import data
 from torch.utils.data import Dataset as BaseDataset
 
 
+###############################################################################
+# DATASET
+###############################################################################
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    # format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("vae_train.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+def get_argument():
+    """
+    Function to return command line argument parsed
+
+    :rtype: argparse.Namespace
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-dt', '--data-train',
+                        type=str, help="Data train path", required=True)
+    parser.add_argument('-dv', '--data-val',
+                        type=str, help="Data validation path", required=True)
+    args = parser.parse_args()
+
+    logger.info("Arguments:")
+    for arg, value in vars(args).items():
+        logger.info(f"  {arg}: {value}")
+    return args
+
+
 def main():
     """
     Main function to run training process
     """
-    ...
+    args = get_argument()
 
 
 if __name__ == '__main__':
+
+    def print_err():
+        """
+        Function of Error tracked printing
+        """
+        # get traceback error
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        tbobj = traceback.extract_tb(exc_traceback)
+
+        # msg += ''.join([' ' for _ in ERRO]) +
+        #     "\t%16s %8s %64s\n" % ("FILE NAME", "LINENO", "MODULE/FUNCTION",);
+        for tb in tbobj:
+            logger.error(
+                "\t%16s %8d %64s\n" % (tb.name, tb.lineno, tb.filename,))
+
     try:
         main()
         exit(0)
     except KeyboardInterrupt as e:
         print("\033[91mCanceled by user!")
         exit(125)
+    except FileNotFoundError:
+        print_err()
+        exit(2)
+    except Exception:  # noqa
+        print_err()
+        exit(1)

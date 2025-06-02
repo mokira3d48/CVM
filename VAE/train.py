@@ -43,6 +43,7 @@ from argparse import ArgumentParser
 
 import yaml
 import numpy as np
+import matplotlib.pyplot as plt
 from PIL import Image
 from tqdm import tqdm
 
@@ -68,6 +69,10 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def clear_console():
+    os.system('cls' if os.name == 'nt' else 'clear')
 
 
 def set_seed(seed=42):
@@ -446,14 +451,25 @@ def test_decoder():
 
 
 class Input(nn.Module):
-    def __init__(self, img_channels=3, img_size=(224, 224)):
+
+    def __init__(
+        self,
+        img_channels=3,
+        img_size=(224, 224),
+        mean=[0.485, 0.456, 0.406],  # noqa
+        std=[0.229, 0.224, 0.225],  # noqa
+        device=None
+    ):
         super().__init__()
         assert img_channels in (1, 3), (
             "Either image channels is equal to 3 or equal to 1"
             f" Never equal to {img_channels}"
         )
         self.img_channels = img_channels
-        self.img_size = img_size
+        self.img_size = list(img_size)
+        self.mean = mean
+        self.std = std
+        self.device = device if device else torch.device('cpu')
         # self.gray_transform = transforms.Compose([
         #     transforms.Grayscale(num_output_channels=1),
         # ])
@@ -477,27 +493,50 @@ class Input(nn.Module):
         x = x.contiguous()
 
         # Resize
-        x = TF.resize(x, self.img_size)
+        # x_size = torch.as_tensor(x.shape[-2:], dtype=torch.int32)
+        # i_size = torch.as_tensor(list(self.img_size), dtype=torch.int32)
+        # x = torch.where(
+        #     torch.all(x_size == i_size), x, TF.resize(x, self.img_size))
+        if x.shape[-2:] != self.img_size:
+            x = TF.resize(x, self.img_size)
 
         # RGB, Gray scale conversion
         if x.shape[1] == 1 and self.img_channels == 3:
             x = torch.cat([x, x, x], dim=1)
-            x = TF.normalize(
-                x, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            x = TF.normalize(x, mean=self.mean, std=self.std)
         elif x.shape[1] == 3 and self.img_channels == 1:
             x = TF.rgb_to_grayscale(x, num_output_channels=1)
             # x = TF.normalize(x, [0.5], [0.5])
 
         # Normalization
-        # x = x / 255.0
-        # TF.normalize()
+        x = x / 255.0
         x = x.to(torch.float32)
         return x
 
 
 class Output(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        mean=[0.485, 0.456, 0.406],  # noqa
+        std=[0.229, 0.224, 0.225],  # noqa
+        device=None,
+    ):
         super().__init__()
+        self.mean = torch.as_tensor(mean)
+        self.std = torch.as_tensor(std)
+        self.device = device
+
+        if not self.device:
+            self.device = torch.device('cpu')
+
+        if self.mean.ndim == 1:
+            self.mean = self.mean.view(-1, 1, 1)
+        if self.std.ndim == 1:
+            self.std = self.std.view(-1, 1, 1)
+
+    def to(self, device):
+        self.mean = self.mean.to(device)
+        self.std = self.std.to(device)
 
     def forward(self, x):
         """
@@ -510,15 +549,18 @@ class Output(nn.Module):
         :type x: torch.Tensor
         :rtype: torch.Tensor
         """
-        if x.shape[1] == 1:
-            x = torch.cat([x, x, x], dim=1)
-
-        # [batch_size, img_channels, h, w]
-        x = x.permute((0, 3, 2, 1))
-        x = x.contiguous()
 
         # DeNormalization
         x = x * 255.0
+        x = x.mul(self.std).add(self.mean)
+
+        # convert to RGB
+        if x.shape[1] == 1:
+            x = torch.cat([x, x, x], dim=1)
+
+        # [batch_size, img_channels, h, w] -> [batch_size, w, h, img_channels]
+        x = x.permute((0, 3, 2, 1))
+        x = x.contiguous()
         x = x.to(torch.uint8)
         return x
 
@@ -545,14 +587,14 @@ class ModelConfig:
                 "mult_factor": self.mult_factor}
 
     def save(self, file_path):
-        data = self.data()
+        config_data = self.data()
         with open(file_path, mode='w', encoding='utf-8') as f:
-            yaml.dump(data, f)
+            yaml.dump(config_data, f)
 
     def load(self, file_path):
         with open(file_path, mode='r', encoding='utf-8') as f:
-            data = yaml.safe_load(f)
-            self.__dict__.update(data)
+            config_data = yaml.safe_load(f)
+            self.__dict__.update(config_data)
 
 
 class VAE(nn.Module):
@@ -563,6 +605,8 @@ class VAE(nn.Module):
             img_channels=self.config.img_channels,
             img_size=self.config.img_size,
         )
+        self.output_function = Output()
+
         self.encoder = None
         self.decoder = None
 
@@ -756,8 +800,9 @@ def test_model_save_load():
 ###############################################################################
 
 class Dataset(BaseDataset):
-    def __init__(self, dataset_dir, augment=False):
+    def __init__(self, dataset_dir, img_size=(224, 224), augment=False):
         self.dataset_dir = dataset_dir
+        self.img_size = img_size
         self.augment = augment
 
         self.image_files = []
@@ -775,7 +820,7 @@ class Dataset(BaseDataset):
                 self.image_files.append(file)
 
     def __len__(self):
-        # return 72  # For an example
+        # return 5  # For an example
         return len(self.image_files)
 
     def __getitem__(self, item):
@@ -783,6 +828,7 @@ class Dataset(BaseDataset):
 
         image = Image.open(image_file)
         image = image.convert('RGB')
+        image = image.resize(self.img_size)
         image = np.asarray(image, dtype=np.uint8)
         input_image = torch.tensor(image)
         output_image = torch.tensor(image)
@@ -826,6 +872,127 @@ class AvgMeter:
         return str(self.total)
 
 
+class Metric:
+    @classmethod
+    def load(cls, state_dict, new_num_epochs=None):
+        """
+        Method to load metric data from state dict
+
+        :param state_dict: The state dict which contents the metrics data
+        :param new_num_epochs: The new value of number of epochs
+        :return: An instance of Metric with loaded data. None value
+          is returned, when the state dict provided is empty or None.
+
+        :type state_dict: `dict`
+        :type new_num_epochs: `int`
+        :rtype: Metric
+        """
+        if not state_dict:
+            return
+        num_epochs = state_dict['num_epochs']
+        num_channels = state_dict['num_channels']
+        if new_num_epochs and new_num_epochs > num_epochs:
+            instance = cls(new_num_epochs, num_channels)
+        else:
+            instance = cls(num_epochs, num_channels)
+        instance.channels = state_dict['channels']
+
+        del state_dict['num_epochs']
+        del state_dict['num_channels']
+        del state_dict['channels']
+
+        for name, values in state_dict.items():
+            metric = instance.__dict__[name]
+            for i in range(instance.num_channels):
+                metric[i, :num_epochs] = values[i, :num_epochs]
+            # logger.info(f"\n\t{name}: {metric}")
+        logger.info("Metric state dict is loaded successfully")
+        return instance
+
+    def __init__(self, num_epochs, num_channels=2):
+        self.num_epochs = num_epochs
+        self.num_channels = num_channels
+
+        self.channels = [f"ch_{c}" for c in range(self.num_channels)]
+
+        self.mse_losses = self.new_buffer()
+        self.kl_divergence_losses = self.new_buffer()
+
+    def new_buffer(self):
+        bf = np.zeros((self.num_channels, self.num_epochs))
+        bf[:] = np.nan
+        return bf
+
+    def channel_id(self, name):
+        if name not in self.channels:
+            raise ValueError(f"No channel name '{name}' found")
+        return self.channels.index(name)
+
+    def __setitem__(self, epoch, metric_values):
+        if not (0 <= epoch < self.num_epochs):
+            logger.warning(
+                "Epoch indexed is out of range. The max epoch indexable"
+                f" is {self.num_epochs}")
+            return
+
+        for m_name, m_values in metric_values.items():
+            if not hasattr(self, m_name):
+                logger.warning(f"Metric named {m_name} is not defined")
+                continue
+            if isinstance(m_values, dict):
+                for chn, m_value in m_values.items():
+                    chi = self.channel_id(chn)
+                    self.__dict__[m_name][chi, epoch] = m_value
+            elif isinstance(m_values, list):
+                if len(m_values) != self.num_channels:
+                    raise ValueError(
+                        "The length of metric values list must be equal"
+                        f"to number channels ({self.num_channels})")
+                for i in range(self.num_channels):
+                    self.__dict__[m_name][i, epoch] = m_values[i]
+
+    def state_dict(self):
+        """
+        Method that is used to return the state dict
+
+        :rtype: `dict`
+        """
+        return self.__dict__
+
+    def plot(self, save_path):
+        """
+        Plot and save training curves
+        """
+        plt.figure(figsize=(12, 10))
+
+        # Plot losses
+        plt.subplot(2, 1, 1)
+        plt.plot(self.epochs, self.cross_entropy_losses, label='Train Loss')
+        plt.plot(self.epochs, self.val_losses, label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training and Validation Loss')
+        plt.legend()
+        plt.grid(True)
+
+        # Plot angle errors
+        plt.subplot(2, 1, 2)
+        plt.plot(epochs, self.train_angles,
+                 label='Train Angle Error (rad)')
+        plt.plot(epochs, self.val_angles,
+                 label='Validation Angle Error (rad)')
+        plt.xlabel('Epoch')
+        plt.ylabel('Angle Error (radians)')
+        plt.title('Training and Validation Angle Error')
+        plt.legend()
+        plt.grid(True)
+
+        # Save the figure
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+
+
 class KLDiv(nn.Module):
     def __init__(self, beta=0.00025):
         super().__init__()
@@ -847,6 +1014,56 @@ class KLDiv(nn.Module):
         kl_divergence = -0.5 * x
         output = self.beta * kl_divergence
         return output
+
+
+class SPG:
+    """
+    Sample Prediction Generator
+
+    :arg file_path: The path to the image file that contents generated image
+    :arg post_process_fn: The post-processing function
+    :type file_path: `str`
+    """
+    def __init__(self, file_path, post_process_fn):
+        self.file_path = file_path
+        self.post_process_fn = post_process_fn
+
+        if not callable(self.post_process_fn):
+            raise ValueError(
+                "The post-process function must be a callable function")
+
+    def generate(self, reconstructed, references):
+        """
+        Function of generation
+
+        :param reconstructed: [batch_size, num_channels, height, width]
+        :param references: [batch_size, num_channels, height, width]
+
+        :type reconstructed: torch.Tensor
+        :type references: torch.Tensor
+        """
+        references = self.post_process_fn(references)
+        reconstructed = self.post_process_fn(reconstructed)
+
+        batch_size = reconstructed.shape[0]
+        iterator = zip(reconstructed, references)
+        plt.figure()
+
+        for i, (recons, reference) in enumerate(iterator):
+            recons = recons.cpu().detach().numpy()
+            reference = reference.cpu().detach().numpy()
+
+            plt.subplot(2, batch_size, i + 1)
+            plt.imshow(reference)
+
+            plt.subplot(2, batch_size, batch_size + i + 1)
+            plt.imshow(recons)
+
+        plt.savefig(self.file_path)
+        logger.info(
+            "Samples generated from reconstructed images is saved"
+            f"at {self.file_path}")
+        # plt.clf()
 
 
 class Trainer(Model):
@@ -910,8 +1127,7 @@ class Trainer(Model):
         self.optimizer = None
         self.lr_scheduler = None
 
-        self.train_losses = {}
-        self.val_losses = {}
+        self.metric = None
         self.recon_loss = AvgMeter()
         self.kl_loss = AvgMeter()
 
@@ -926,6 +1142,8 @@ class Trainer(Model):
         self.resume_ckpt = None
         self.best_model = None
         self.epoch = 0
+
+        self.spg = None
 
     def compile(self, args):
         """
@@ -945,14 +1163,15 @@ class Trainer(Model):
 
         train_ds_dir = args.train_ds_dir
         val_ds_dir = args.val_ds_dir
+        img_size = self.config.img_size
         if not os.path.isdir(train_ds_dir):
             raise FileNotFoundError(
                 f"No such training set directory at {train_ds_dir}")
         if not os.path.isdir(val_ds_dir):
             raise FileNotFoundError(
                 f"No such validation set directory at {val_ds_dir}")
-        train_dataset = Dataset(train_ds_dir)
-        val_dataset = Dataset(val_ds_dir)
+        train_dataset = Dataset(train_ds_dir, img_size)
+        val_dataset = Dataset(val_ds_dir, img_size)
 
         # Create data loaders
         self.train_loader = data.DataLoader(
@@ -976,6 +1195,9 @@ class Trainer(Model):
         self.resume_ckpt = args.resume
         self.checkpoint_dir = args.checkpoint_dir
         self.best_model = args.best_model
+
+        spg_file_path = os.path.join(self.checkpoint_dir, 'samples.jpg')
+        self.spg = SPG(spg_file_path, self.output_function)
 
     @staticmethod
     def _update_losses(input_losses, output_losses):
@@ -1015,8 +1237,9 @@ class Trainer(Model):
             "optimizer_state_dict": self.optimizer.state_dict(),
             "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
             "epoch": self.epoch,
-            "train_losses": self.train_losses,
-            "val_losses": self.val_losses,
+            "metric_state_dict": self.metric.state_dict(),
+            # "train_losses": self.train_losses,
+            # "val_losses": self.val_losses,
             # "best_performance": self.best_performance,
             **kwargs}
 
@@ -1028,7 +1251,7 @@ class Trainer(Model):
         copy(file_path1, file_path2)
         logger.info("Checkpoint done successfully")
 
-        if self.epoch >= 2 and (self.epoch % 2) == 0:
+        if self.epoch >= 2:
             old_checkpoint_file = os.path.join(
                 self.checkpoint_dir, f"checkpoint_{self.epoch - 2}.pth")
             if os.path.isfile(old_checkpoint_file):
@@ -1047,8 +1270,10 @@ class Trainer(Model):
         self.optimizer.load_state_dict(ckpt_data['optimizer_state_dict'])
         self.lr_scheduler.load_state_dict(ckpt_data['lr_scheduler_state_dict'])
         self.epoch = ckpt_data['epoch'] + 1
-        self.train_losses = ckpt_data['train_losses']
-        self.val_losses = ckpt_data['val_losses']
+        # self.train_losses = ckpt_data['train_losses']
+        # self.val_losses = ckpt_data['val_losses']
+        self.metric = Metric.load(
+            ckpt_data.get('metric_state_dict'), self.num_epochs)
         # self.best_performance = ckpt_data['best_performance']
         logger.info(f"Checkpoint loaded successfully from {self.resume_ckpt}!")
 
@@ -1113,8 +1338,8 @@ class Trainer(Model):
             self.train_step(images, targets, write_fn, is_last_index)
 
             loss_data = {
-                "recon_loss": self.recon_loss.avg(),
-                "kl_loss": self.kl_loss.avg()}
+                "mse_losses": self.recon_loss.avg(),
+                "kl_divergence_losses": self.kl_loss.avg()}
             iterator.set_postfix(loss_data)
 
         return loss_data
@@ -1124,6 +1349,9 @@ class Trainer(Model):
         loss_data = {}
         self.recon_loss.reset()
         self.kl_loss.reset()
+
+        references = None
+        predictions = None
 
         self.eval()
         with torch.no_grad():
@@ -1150,10 +1378,16 @@ class Trainer(Model):
                 self.kl_loss += kl_divergence.item()
 
                 loss_data.update({
-                    "recon_loss": self.recon_loss.avg(),
-                    "kl_loss": self.kl_loss.avg()})
+                    "mse_losses": self.recon_loss.avg(),
+                    "kl_divergence_losses": self.kl_loss.avg()})
                 iterator.set_postfix(loss_data)
 
+                random_val = np.random.rand()
+                if None in (predictions, references) and random_val < 0.3:
+                    references = targets
+                    predictions = reconstructed_image
+
+            self.spg.generate(reconstructed_image, targets)
         return loss_data
 
     def fit(self):
@@ -1169,6 +1403,13 @@ class Trainer(Model):
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.load_checkpoint()
 
+        if not self.metric:
+            self.metric = Metric(self.num_epochs, 2)
+            self.metric.channels[0] = "train"
+            self.metric.channels[1] = "val"
+
+        self.output_function.to(self.device())
+
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
             logger.info(f'Epoch: {epoch + 1} / {self.num_epochs}:')
@@ -1180,7 +1421,9 @@ class Trainer(Model):
 
             # Add losses to train losses epochs
             # Save checkpoint with the current model state
-            self._add_to_epoch_results(self.train_losses, train_losses)
+            # self._add_to_epoch_results(self.train_losses, train_losses)
+            self.metric[epoch] = {
+                name: {"train": value} for name, value in train_losses.items()}
 
             logger.info(f'{self.print_results(train_losses)}')
 
@@ -1189,7 +1432,9 @@ class Trainer(Model):
 
             val_losses = self.validate()
 
-            self._add_to_epoch_results(self.val_losses, val_losses)
+            # self.add_to_epoch_results(self.val_losses, val_losses)
+            self.metric[epoch] = {
+                name: {"val": value} for name, value in val_losses.items()}
 
             logger.info(f'{self.print_results(val_losses)}')
 
@@ -1199,6 +1444,7 @@ class Trainer(Model):
             if epoch != (self.num_epochs - 1):
                 # Epochs are remaining
                 logger.info(("-" * 80) + "\n")
+                clear_console()
 
         self.save_encoder("vae_encoder")
         self.save_decoder("vae_decoder")
