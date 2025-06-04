@@ -69,6 +69,51 @@ logger = logging.getLogger(__name__)
 ###############################################################################
 
 
+def logits_2_x_min_y_min_x_max_y_max(normalized_boxes, img_size):
+    """
+    Function to convert [x, y, w, h] to [x_min, y_min, x_max, y_max]
+
+    :param normalized_boxes: The bounding box formatted as x, y, w, h
+    :param img_size: The image size
+    :returns: The same bounding box formatted as x_min, y_min,
+      x_max, y_max.
+
+    :type normalized_boxes: list
+    :type img_size: tuple
+    :rtype: torch.Tensor
+    """
+    img_h, img_w = img_size
+    center_x = normalized_boxes[0] * img_w
+    center_y = normalized_boxes[1] * img_h
+    w = normalized_boxes[2] * img_w
+    h = normalized_boxes[3] * img_h
+    x = center_x - w / 2
+    y = center_y - h / 2
+
+    x_min = x
+    y_min = y
+    x_max = x + w
+    y_max = y + h
+    xy_min_max = torch.as_tensor([x_min, y_min, x_max, y_max])
+    return xy_min_max
+
+
+def get_bounding_box(logit_values, image_shape):
+    """
+    :type logit_values: `tuple` of  `float`
+    :type image_shape: `tuple` of `int`
+    :rtype: `tuple` of `float`
+    """
+    img_h, img_w = image_shape[:2]
+    center_x = logit_values[0] * img_w
+    center_y = logit_values[1] * img_h
+    w = logit_values[2] * img_w
+    h = logit_values[3] * img_h
+    x = center_x - w / 2
+    y = center_y - h / 2
+    return x, y, w, h
+
+
 ###############################################################################
 # Training config
 ###############################################################################
@@ -133,24 +178,33 @@ def gamma(image, alpha=1.0, beta=0.0):
 class Dataset(BaseDataset):
 
     def __init__(
-        self, dataset_dir, images, class_ids, bboxes, class_names,
-        img_size=(224, 224), coeff=None, num_boxes=2, cell_x=16, cell_y=12,
-        max_objects=60
+        self, dataset_dir, images, class_ids, bboxes, class_names, anchors,
+        img_size=(224, 224), coeff=None, cell_x=16, cell_y=12, max_objects=60
     ):
         self.dataset_dir = dataset_dir
         self.images = images
         self.class_ids = class_ids
         self.bboxes = bboxes
         self.class_names = class_names
+        self.anchors = anchors
         self.img_size = img_size
         self.coeff = coeff
-        self.num_boxes = num_boxes
         self.cell_x = cell_x
         self.cell_y = cell_y
         self.max_objects = max_objects
 
+        self.r_x = int(self.img_size[0] / self.cell_x)
+        self.r_y = int(self.img_size[1] / self.cell_y)
+        self.num_boxes = len(self.anchors)
+
         if self.coeff is None:
             self.coeff = random.uniform(1.1, 2.5)
+
+    def is_xmin_xmax(self, boxes):
+        """
+        Verify if bounding box values are x_min, x_max
+        """
+        return all(x >= 1 for x in boxes)
 
     def __len__(self):
         return len(self.images)
@@ -168,7 +222,7 @@ class Dataset(BaseDataset):
         # Perform zooming
         zoom_x = int(self.coeff * self.img_size[0])
         zoom_y = int(self.coeff * self.img_size[1])
-        image_r = TF.resize(image, [zoom_x, zoom_y])
+        image_r = TF.resize(image, size=[zoom_x, zoom_y])
 
         # Add noise into image
         image_r = noise(image_r)
@@ -198,7 +252,76 @@ class Dataset(BaseDataset):
         class_ids = torch.as_tensor(class_ids)  # [p,]
 
         # Bounding boxes
-        bboxes = torch.as_tensor(bboxes)  # [p, 4]
+        boxes = []
+        obj_id = 0
+        for cls_id, bbox in zip(class_ids, bboxes):
+            if not self.is_xmin_xmax(bbox):
+                bbox = logits_2_x_min_y_min_x_max_y_max(bbox, image.shape[:2])
+
+            x_min, y_min, x_max, y_max = bbox
+            x_min = int(x_min * ratio_x)
+            y_min = int(y_min * ratio_y)
+            x_max = int(x_max * ratio_x)
+            y_max = int(y_max * ratio_y)
+
+            x_min = (x_min - shift_x) / self.r_x
+            y_min = (y_min - shift_y) / self.r_y
+            x_max = (x_max - shift_x) / self.r_x
+            y_max = (y_max - shift_y) / self.r_y
+
+            area = (x_max - x_min) * (y_max - y_min)
+            label2[obj_id] = np.asarray(
+                [x_min, y_min, x_max, y_max, area, 1, cls_id])
+
+            x_centre = int(x_min + (x_max - x_min) / 2)
+            y_centre = int(y_min + (y_max - y_min) / 2)
+            x_cell = int(x_centre)
+            y_cell = int(y_centre)
+
+            a_x_min = x_centre - self.anchors[:, 0] / 2
+            a_y_min = y_centre - self.anchors[:, 1] / 2
+            a_x_max = x_centre + self.anchors[:, 0] / 2
+            a_y_max = y_centre + self.anchors[:, 1] / 2
+
+            id_a = 0
+            best_iou = 0
+            for i in range(len(self.anchors)):
+                iou = intersection_over_union([x_min, y_min, x_max, y_max],
+                                              [a_x_min[i], a_y_min[i],
+                                               a_x_max[i], a_y_max[i]])
+                if iou > best_iou:
+                    best_iou = iou
+                    id_a = i
+
+            label[y_cell, x_cell, id_a, 0] = (x_max + x_min) / 2
+            label[y_cell, x_cell, id_a, 1] = (y_max + y_min) / 2
+            label[y_cell, x_cell, id_a, 2] = x_max - x_min
+            label[y_cell, x_cell, id_a, 3] = y_max - y_min
+            label[y_cell, x_cell, id_a, 4] = 1.
+            label[y_cell, x_cell, id_a, 5 + cls_id] = 1.
+
+            obj_id = obj_id + 1
+            if obj_id == self.max_objects:
+                logger.info("Maximum number of objects reached !!!!!")
+                break
+
+        image_r = image_r[shift_y:(shift_y + self.img_size[1]),
+                          shift_x:(shift_x + self.img_size[0])]
+        return image_r, label, label2
+
+
+def load_coco(dataset_dir):
+    """
+    Function to load coco dataset
+
+    :param dataset_dir: The path to directory of the dataset
+    :returns: images, classes, bounding boxes and available class names.
+    """
+    images_folder = os.path.join(dataset_dir, "images")
+    labels_folder = os.path.join(dataset_dir, "labels")
+
+    image_files = os.listdir(images_folder)
+    ...
 
 
 
