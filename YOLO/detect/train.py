@@ -42,6 +42,7 @@ import random
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
@@ -319,6 +320,37 @@ class Dataset(BaseDataset):
         return image_r, label, label2
 
 
+class CocoDatasetCollector:
+
+    def __init__(self, dataset_dir):
+        self.dataset_dir = dataset_dir
+        self.config_file = os.path.join(dataset_dir, "data.yaml")
+        self.train_images_dir = None
+        self.val_images_dir = None
+        self.test_images_dir = None
+
+    def collect(self):
+        config = self.load_config_file()
+        if 'train' not in config:
+            raise ValueError(
+                "The train directory is not defined in the config file"
+                f" located at {self.config_file}.")
+
+        if 'val' not in config:
+            raise ValueError(
+                "The `val` directory representing validation data,"
+                " is not defined in the config file"
+                f" located at {self.config_file}.")
+
+        self.train_images_dir = os.path.join(self.dataset_dir, config['train'])
+        self.val_images_dir = os.path.join(self.dataset_dir, config['val'])
+        if 'test' in config:
+            self.test_images_dir = os.path.join(
+                self.dataset_dir, config['test'])
+
+
+
+
 def load_coco(dataset_dir):
     """
     Function to load coco dataset
@@ -326,11 +358,21 @@ def load_coco(dataset_dir):
     :param dataset_dir: The path to directory of the dataset
     :returns: images, classes, bounding boxes and available class names.
     """
+    features = []
+    labels = []
+    folder_name = os.path.basename(dataset_dir)
     images_folder = os.path.join(dataset_dir, "images")
     labels_folder = os.path.join(dataset_dir, "labels")
 
     image_files = os.listdir(images_folder)
-    ...
+    iter_desc = f"Collecting of dataset from {folder_name}"
+    iterator = tqdm(image_files, desc=iter_desc)
+    num_samples = 0
+    for image_file in iterator:
+        image_fp = os.path.join(images_folder, image_file)
+        features.append()
+
+
 
 
 
