@@ -216,13 +216,17 @@ class Dataset(BaseDataset):
 
         # Open image file
         image = Image.open(image_file).convert('RGB')
+
         image = np.asarray(image)
         image = torch.as_tensor(image)
 
         # Perform zooming
         zoom_x = int(self.coeff * self.img_size[0])
         zoom_y = int(self.coeff * self.img_size[1])
-        image_r = TF.resize(image, size=[zoom_x, zoom_y])
+        image_r = image.resize(zoom_x, zoom_y)
+
+        image = torch.as_tensor(np.asarray(image))
+        image_r = torch.as_tensor(np.asarray(image_r))
 
         # Add noise into image
         image_r = noise(image_r)
@@ -236,14 +240,14 @@ class Dataset(BaseDataset):
 
         # S: cell_x
         # S: cell_y
-        # B: num_boxes
+        # B: num_boxes == num of anchors
         # C: num_classes
         label_shape = (self.cell_y,
                        self.cell_x,
                        self.num_boxes,
                        5 + len(self.class_names))
-        label = np.zeros(label_shape, dtype=np.float32)
-        label2 = np.zeros((self.max_objects, 7), dtype=np.float32)
+        label = torch.zeros(label_shape, dtype=np.float32)
+        label2 = torch.zeros((self.max_objects, 7), dtype=np.float32)
 
         ratio_x = self.coeff * self.img_size[0] / image.shape[0]
         ratio_y = self.coeff * self.img_size[1] / image.shape[1]
@@ -252,7 +256,6 @@ class Dataset(BaseDataset):
         class_ids = torch.as_tensor(class_ids)  # [p,]
 
         # Bounding boxes
-        boxes = []
         obj_id = 0
         for cls_id, bbox in zip(class_ids, bboxes):
             if not self.is_xmin_xmax(bbox):
@@ -264,13 +267,19 @@ class Dataset(BaseDataset):
             x_max = int(x_max * ratio_x)
             y_max = int(y_max * ratio_y)
 
+            if x_min < shift_x \
+                or y_min < shift_y \
+                or x_max > (shift_x + self.img_size[0]) \
+                or y_max > (shift_y + self.img_size[1]):
+                continue
+
             x_min = (x_min - shift_x) / self.r_x
             y_min = (y_min - shift_y) / self.r_y
             x_max = (x_max - shift_x) / self.r_x
             y_max = (y_max - shift_y) / self.r_y
 
             area = (x_max - x_min) * (y_max - y_min)
-            label2[obj_id] = np.asarray(
+            label2[obj_id] = torch.tensor(
                 [x_min, y_min, x_max, y_max, area, 1, cls_id])
 
             x_centre = int(x_min + (x_max - x_min) / 2)
