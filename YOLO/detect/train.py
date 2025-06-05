@@ -41,6 +41,7 @@ import argparse
 import random
 
 import numpy as np
+import yaml
 from PIL import Image
 from tqdm import tqdm
 
@@ -326,8 +327,32 @@ class CocoDatasetCollector:
         self.dataset_dir = dataset_dir
         self.config_file = os.path.join(dataset_dir, "data.yaml")
         self.train_images_dir = None
+        self.train_labels_dir = None
         self.val_images_dir = None
+        self.val_labels_dir = None
         self.test_images_dir = None
+        self.test_labels_dir = None
+
+        self.class_names = None
+        self.train_image_files = []
+        self.train_class_ids = []
+        self.train_boxes = []
+
+        self.val_image_files = []
+        self.val_class_ids = []
+        self.val_boxes = []
+
+        self.test_image_files = []
+        self.test_class_ids = []
+        self.test_boxes = []
+
+    def load_config_file(self):
+        """
+        Function to load content of the config file
+        """
+        with open(self.config_file, mode='r', encoding='utf-8') as f:
+            content = yaml.safe_load(f)
+        return content
 
     def collect(self):
         config = self.load_config_file()
@@ -342,12 +367,49 @@ class CocoDatasetCollector:
                 " is not defined in the config file"
                 f" located at {self.config_file}.")
 
+        if 'names' not in config:
+            raise ValueError("The list of the class names is not defined.")
+
         self.train_images_dir = os.path.join(self.dataset_dir, config['train'])
         self.val_images_dir = os.path.join(self.dataset_dir, config['val'])
         if 'test' in config:
             self.test_images_dir = os.path.join(
                 self.dataset_dir, config['test'])
+            logger.info(
+                "The images of test directory is located at:"
+                f" {self.test_images_dir}")
 
+        logger.info(
+            "The images of training directory is located at:"
+            f" {self.train_images_dir}")
+        logger.info(
+            "The images of validation directory is located at:"
+            f" {self.val_images_dir}")
+
+        self.class_names = config['names']
+        logger.info(f"The class names found: {','.join(self.class_names)}")
+
+        train_label_dir = config['train'].replace('images', 'labels')
+        val_label_dir = config['val'].replace('images', 'labels')
+        self.train_labels_dir = os.path.join(self.dataset_dir, train_label_dir)
+        self.val_labels_dir = os.path.join(self.dataset_dir, val_label_dir)
+
+        if 'test' in config:
+            test_label_dir = config['test'].replace('images', 'labels')
+            self.test_labels_dir = os.path.join(
+                self.dataset_dir, test_label_dir)
+            logger.info(
+                "The labels of test directory is located at:"
+                f" {self.test_labels_dir}")
+
+        logger.info(
+            "The labels of training directory is located at:"
+            f" {self.train_labels_dir}")
+        logger.info(
+            "The labels of validation directory is located at:"
+            f" {self.val_labels_dir}")
+
+        ...
 
 
 
@@ -370,10 +432,7 @@ def load_coco(dataset_dir):
     num_samples = 0
     for image_file in iterator:
         image_fp = os.path.join(images_folder, image_file)
-        features.append()
-
-
-
+        # features.append()
 
 
 ###############################################################################
