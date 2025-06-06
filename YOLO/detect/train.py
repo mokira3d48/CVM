@@ -372,16 +372,74 @@ class CocoDatasetCollector:
             content = yaml.safe_load(f)
         return content
 
-    def _load_labels(self, image_files, label_files):
+    @staticmethod
+    def load_label(file_path):
         """
-        Function allows to load labels from text files
-        and associate each of them with their image.
+        Function allows to load class IDs and bounding boxes contained
+        in the text file located at file_path
 
+        :type file_path: str
+        :rtype: typing.Tuple[typing.List[int], numpy.ndarray]
+        """
+        with open(file_path, mode='r') as f:
+            content_file = f.read()
+            lines = content_file.split('\n')
+            lines = [line for line in lines if line.strip()]
+
+            bboxes = []
+            cl_ids = []
+
+            for line in lines:
+                try:
+                    line_split = line.split(' ')
+                    class_id = int(line_split[0])
+                    if len(line_split) != 5:
+                        continue
+                    x = float(line_split[1])
+                    y = float(line_split[2])
+                    w = float(line_split[3])
+                    h = float(line_split[4])
+                    if x > 1 or y > 1 or w > 1 or h > 1:
+                        continue
+                    cl_ids.append(class_id)
+                    bboxes.append([x, y, w, h])
+                except ValueError as e:
+                    logger.warning(f"{e}")
+                    continue
+
+            bboxes = np.asarray(bboxes, dtype=np.float32)
+            return cl_ids, bboxes
+
+    def _load_data(self, image_files, labels_dir):
+        """
+        Private method that allows to load labels from text files
+        and associate each of them with their image
+
+        :type image_files: `list` of `str`
+        :type labels_dir: `str`
         :rtype: typing.Tuple[typing.List[str], typing.List[int], numpy.ndarray]
         """
+        if not image_files:
+            # The list of image file paths is empty, so we return None
+            return
+        images = []
+        classes = []
+        bboxes = []
         for image_file in image_files:
+            file_path_without_ext = get_fn_without_ext(image_file)
+            label_file = os.path.join(
+                labels_dir, f"{file_path_without_ext}.txt"
+            )
+            if not os.path.isfile(label_file):
+                logger.warning(f"No such label file at: {label_file}")
+                continue
+            class_ids, boxes = self.load_label(label_file)
+            images.append(image_file)
+            classes.append(class_ids)
+            bboxes.append(boxes)
 
-
+        bboxes = np.asarray(bboxes, dtype=np.float32)
+        return images, classes, bboxes
 
     def collect(self):
         config = self.load_config_file()
@@ -456,65 +514,45 @@ class CocoDatasetCollector:
             f" {self.val_labels_dir}"
         )
 
+        # Load all file names of images contained on image directory
+        # of each sub dataset (train, val, and test set)
         train_image_files = os.listdir(self.train_images_dir)
-        train_label_files = os.listdir(self.train_labels_dir)
         val_image_files = os.listdir(self.val_images_dir)
-        val_label_files = os.listdir(self.val_labels_dir)
         test_image_files = []
-        test_label_files = []
         if self.test_labels_dir:
             test_image_files.extend(os.listdir(self.test_images_dir))
-            test_label_files.extend(os.listdir(self.test_labels_dir))
 
+        # Build full file path to each image file listed from sub-datasets
         train_image_files = [
             str(os.path.join(self.train_images_dir, s))
             for s in train_image_files
         ]
-
         val_image_files = [
             str(os.path.join(self.val_images_dir, s))
             for s in val_image_files
         ]
-
-        test_label_files = [
+        test_image_files = [
             str(os.path.join(self.test_images_dir, s))
-            for s in test_label_files
+            for s in test_image_files
         ]
 
-        train_label_files = [
-            str(os.path.join(self.train_labels_dir, s))
-            for s in train_label_files
-        ]
-        val_label_files = [
-            str(os.path.join(self.val_labels_dir, s))
-            for s in val_label_files
-        ]
-        test_label_files = [
-            str(os.path.join(self.test_labels_dir, s))
-            for s in test_label_files
-        ]
+        # load sub-datasets
+        returned1 = self._load_data(train_image_files, self.train_labels_dir)
+        returned2 = self._load_data(val_image_files, self.val_labels_dir)
+        returned3 = self._load_data(test_image_files, self.val_labels_dir)
 
+        self.train_image_files.extend(returned1[0])
+        self.train_class_ids.extend(returned1[1])
+        self.train_boxes.extend(returned1[2])
 
-def load_coco(dataset_dir):
-    """
-    Function to load coco dataset
+        self.val_image_files.extend(returned2[0])
+        self.val_class_ids.extend(returned2[1])
+        self.val_boxes.extend(returned2[2])
 
-    :param dataset_dir: The path to directory of the dataset
-    :returns: images, classes, bounding boxes and available class names.
-    """
-    features = []
-    labels = []
-    folder_name = os.path.basename(dataset_dir)
-    images_folder = os.path.join(dataset_dir, "images")
-    labels_folder = os.path.join(dataset_dir, "labels")
-
-    image_files = os.listdir(images_folder)
-    iter_desc = f"Collecting of dataset from {folder_name}"
-    iterator = tqdm(image_files, desc=iter_desc)
-    num_samples = 0
-    for image_file in iterator:
-        image_fp = os.path.join(images_folder, image_file)
-        # features.append()
+        if returned3 is not None:
+            self.test_image_files.extend(returned3[0])
+            self.test_class_ids.extend(returned3[1])
+            self.test_boxes.extend(returned3[2])
 
 
 ###############################################################################
