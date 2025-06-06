@@ -321,6 +321,24 @@ class Dataset(BaseDataset):
         return image_r, label, label2
 
 
+def get_fn_without_ext(s):
+    """
+    Function to extract name without extension
+
+    :param s: The file name with its extension
+    :returns: The name without its extension.
+
+    :type s: `str`
+    :rtype: `str`
+    """
+    if not s:
+        return ''
+    fp_split = s.split('.')
+    fn_split = [x for x in fp_split if x]
+    file_name = '.'.join(fn_split[:-1] if len(fn_split) > 1 else fn_split)
+    return file_name
+
+
 class CocoDatasetCollector:
 
     def __init__(self, dataset_dir):
@@ -354,63 +372,127 @@ class CocoDatasetCollector:
             content = yaml.safe_load(f)
         return content
 
+    def _load_labels(self, image_files, label_files):
+        """
+        Function allows to load labels from text files
+        and associate each of them with their image.
+
+        :rtype: typing.Tuple[typing.List[str], typing.List[int], numpy.ndarray]
+        """
+        for image_file in image_files:
+
+
+
     def collect(self):
         config = self.load_config_file()
         if 'train' not in config:
             raise ValueError(
                 "The train directory is not defined in the config file"
-                f" located at {self.config_file}.")
+                f" located at {self.config_file}."
+            )
 
         if 'val' not in config:
             raise ValueError(
                 "The `val` directory representing validation data,"
                 " is not defined in the config file"
-                f" located at {self.config_file}.")
+                f" located at {self.config_file}."
+            )
 
         if 'names' not in config:
             raise ValueError("The list of the class names is not defined.")
 
-        self.train_images_dir = os.path.join(self.dataset_dir, config['train'])
-        self.val_images_dir = os.path.join(self.dataset_dir, config['val'])
+        self.train_images_dir = str(
+            os.path.join(self.dataset_dir, config['train'])
+        )
+        self.val_images_dir = str(
+            os.path.join(self.dataset_dir, config['val'])
+        )
         if 'test' in config:
-            self.test_images_dir = os.path.join(
-                self.dataset_dir, config['test'])
+            self.test_images_dir = str(
+                os.path.join(self.dataset_dir, config['test'])
+            )
             logger.info(
                 "The images of test directory is located at:"
-                f" {self.test_images_dir}")
+                f" {self.test_images_dir}"
+            )
 
         logger.info(
             "The images of training directory is located at:"
-            f" {self.train_images_dir}")
+            f" {self.train_images_dir}"
+        )
         logger.info(
             "The images of validation directory is located at:"
-            f" {self.val_images_dir}")
+            f" {self.val_images_dir}"
+        )
 
         self.class_names = config['names']
         logger.info(f"The class names found: {','.join(self.class_names)}")
 
         train_label_dir = config['train'].replace('images', 'labels')
         val_label_dir = config['val'].replace('images', 'labels')
-        self.train_labels_dir = os.path.join(self.dataset_dir, train_label_dir)
-        self.val_labels_dir = os.path.join(self.dataset_dir, val_label_dir)
+        self.train_labels_dir = str(
+            os.path.join(self.dataset_dir, train_label_dir)
+        )
+        self.val_labels_dir = str(
+            os.path.join(self.dataset_dir, val_label_dir)
+        )
 
         if 'test' in config:
             test_label_dir = config['test'].replace('images', 'labels')
-            self.test_labels_dir = os.path.join(
-                self.dataset_dir, test_label_dir)
+            self.test_labels_dir = str(
+                os.path.join(self.dataset_dir, test_label_dir)
+            )
             logger.info(
                 "The labels of test directory is located at:"
-                f" {self.test_labels_dir}")
+                f" {self.test_labels_dir}"
+            )
 
         logger.info(
             "The labels of training directory is located at:"
-            f" {self.train_labels_dir}")
+            f" {self.train_labels_dir}"
+        )
         logger.info(
             "The labels of validation directory is located at:"
-            f" {self.val_labels_dir}")
+            f" {self.val_labels_dir}"
+        )
 
-        ...
+        train_image_files = os.listdir(self.train_images_dir)
+        train_label_files = os.listdir(self.train_labels_dir)
+        val_image_files = os.listdir(self.val_images_dir)
+        val_label_files = os.listdir(self.val_labels_dir)
+        test_image_files = []
+        test_label_files = []
+        if self.test_labels_dir:
+            test_image_files.extend(os.listdir(self.test_images_dir))
+            test_label_files.extend(os.listdir(self.test_labels_dir))
 
+        train_image_files = [
+            str(os.path.join(self.train_images_dir, s))
+            for s in train_image_files
+        ]
+
+        val_image_files = [
+            str(os.path.join(self.val_images_dir, s))
+            for s in val_image_files
+        ]
+
+        test_label_files = [
+            str(os.path.join(self.test_images_dir, s))
+            for s in test_label_files
+        ]
+
+        train_label_files = [
+            str(os.path.join(self.train_labels_dir, s))
+            for s in train_label_files
+        ]
+        val_label_files = [
+            str(os.path.join(self.val_labels_dir, s))
+            for s in val_label_files
+        ]
+        test_label_files = [
+            str(os.path.join(self.test_labels_dir, s))
+            for s in test_label_files
+        ]
 
 
 def load_coco(dataset_dir):
