@@ -129,7 +129,7 @@ for more details, contact me please.
 
 ## Contact
 
-For your question or suggestion, contact me please :
+For your question or suggestion, contact me please:
 
 - **Name** : Doctor Mokira
 - **Email** : dr.mokira@gmail.com
