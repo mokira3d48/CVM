@@ -339,7 +339,7 @@ def get_fn_without_ext(s):
     return file_name
 
 
-class CocoDatasetCollector:
+class CocoDataCollector:
 
     def __init__(self, dataset_dir):
         self.dataset_dir = dataset_dir

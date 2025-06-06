@@ -3,9 +3,9 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "CVANet"
+name = "CVA_NET"
 version = "0.1.0"
-description = " This repository contents different scripts for different models to allow you to train a model of images classification."
+description = "This repository contents different scripts for different models to allow you to train a model of images classification."
 readme = "README.md"
 authors = [
     { name = "Doctor Mokira", email = "dr.mokira@gmail.com" },
