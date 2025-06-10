@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CVA_NET"
+version = "0.1.0"
+description = "This repository contents different scripts for different models to allow you to train a model of images classification."
+readme = "README.md"
+authors = [
+    { name = "Doctor Mokira", email = "dr.mokira@gmail.com" },
+]
+license = { file = "LICENSE" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+keywords = [
+    "cvanet", "image-processing", "deep-learning-algorithms",
+    "image-classification", "object-detection", "image-generation"
+]
+dependencies = [
+    "requests>=2.25.1",
+    "Pyyaml",
+    "tqdm",
+    "numpy",
+    "matplotlib",
+    "scikit-learn",
+    "opencv-python",
+    "Pillow",
+    "torch",
+    "torchvision",
+    "torchinfo==1.8.0",
+    "pytest",
+
+]
+
+[project.urls]
+"Homepage" = "https://github.com/mokira3d48/CVANet"
+#"Bug Tracker" = "https://github.com/your-username/my-python-package/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+vae-train = "cvn.VAE.train:main"
+yolo-detect-train = "cvn.YOLO.detect.train:main"

@@ -1,5 +1,5 @@
 #!/bin/bash
-venv/bin/python3 train.py -n 1000 -b 16 -gas 256 -lr 1e-5 \
+venv/bin/python3 src/cvn/VAE/train.py -n 1000 -b 16 -gas 256 -lr 1e-5 \
 	--img-size 112 --img-channels 3 -z-ch 16 \
 	-dt "dataset/train" \
 	-dv "dataset/val" \

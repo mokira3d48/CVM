@@ -1,5 +1,5 @@
 #!/bin/bash
-python vae/fine_tuning.py -n 100 -b 16 -gas 128 \
+python src/cvn/VAE/fine_tuning.py -n 100 -b 16 -gas 128 \
   --bottleneck "fc1layer" --num-classes 36 \
   -dt "dataset/train" \
   -dv "dataset/val" \
