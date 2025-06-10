@@ -180,8 +180,9 @@ def gamma(image, alpha=1.0, beta=0.0):
 class Dataset(BaseDataset):
 
     def __init__(
-        self, dataset_dir, images, class_ids, bboxes, class_names, anchors,
-        img_size=(224, 224), coeff=None, cell_x=16, cell_y=12, max_objects=60
+        self, dataset_dir, images, class_ids, bboxes, class_names,
+        anchors=None, img_size=(224, 224), coeff=None, cell_x=16, cell_y=12,
+        max_objects=60
     ):
         self.dataset_dir = dataset_dir
         self.images = images
@@ -195,12 +196,12 @@ class Dataset(BaseDataset):
         self.cell_y = cell_y
         self.max_objects = max_objects
 
+        if not self.anchors:
+            self.anchors = np.array([[3.0, 1.5], [2.0, 2.0], [1.5, 3.0]])
+
         self.r_x = int(self.img_size[0] / self.cell_x)
         self.r_y = int(self.img_size[1] / self.cell_y)
         self.num_boxes = len(self.anchors)
-
-        if self.coeff is None:
-            self.coeff = random.uniform(1.1, 2.5)
 
     def is_xmin_xmax(self, boxes):
         """
@@ -219,26 +220,30 @@ class Dataset(BaseDataset):
         # Open image file
         image = Image.open(image_file).convert('RGB')
 
-        image = np.asarray(image)
-        image = torch.as_tensor(image)
+        if self.coeff is None:
+            self.coeff = random.uniform(1.0, 2.5)
 
         # Perform zooming
-        zoom_x = int(self.coeff * self.img_size[0])
-        zoom_y = int(self.coeff * self.img_size[1])
-        image_r = image.resize(zoom_x, zoom_y)
+        # zoom_x = int(self.coeff * self.img_size[1])
+        # zoom_y = int(self.coeff * self.img_size[0])
+        # image_r = image.resize((zoom_x, zoom_y))
+        image_r = image.resize(self.img_size)
 
-        image = torch.as_tensor(np.asarray(image))
-        image_r = torch.as_tensor(np.asarray(image_r))
+        image = np.array(image)
+        image_r = np.array(image_r)
 
         # Add noise into image
         image_r = noise(image_r)
 
-        if self.coeff == 1:
-            shift_x = 0
-            shift_y = 0
-        else:
-            shift_x = np.random.randint(image_r.shape[0] - self.img_size[0])
-            shift_y = np.random.randint(image_r.shape[1] - self.img_size[1])
+        image = torch.as_tensor(image)
+        image_r = torch.as_tensor(image_r)
+
+        # if self.coeff == 1.0:
+        #     shift_x = 0
+        #     shift_y = 0
+        # else:
+        #     shift_x = np.random.randint(image_r.shape[0] - self.img_size[1])
+        #     shift_y = np.random.randint(image_r.shape[1] - self.img_size[0])
 
         # S: cell_x
         # S: cell_y
@@ -248,11 +253,12 @@ class Dataset(BaseDataset):
                        self.cell_x,
                        self.num_boxes,
                        5 + len(self.class_names))
-        label = torch.zeros(label_shape, dtype=np.float32)
-        label2 = torch.zeros((self.max_objects, 7), dtype=np.float32)
+        logger.info("------------label_shape: " + str(label_shape))
+        label = torch.zeros(label_shape, dtype=torch.float32)
+        label2 = torch.zeros((self.max_objects, 7), dtype=torch.float32)
 
-        ratio_x = self.coeff * self.img_size[0] / image.shape[0]
-        ratio_y = self.coeff * self.img_size[1] / image.shape[1]
+        # ratio_x = self.coeff * self.img_size[0] / image.shape[0]
+        # ratio_y = self.coeff * self.img_size[1] / image.shape[1]
 
         # Class ids
         class_ids = torch.as_tensor(class_ids)  # [p,]
@@ -262,27 +268,34 @@ class Dataset(BaseDataset):
         for cls_id, bbox in zip(class_ids, bboxes):
             if not self.is_xmin_xmax(bbox):
                 bbox = logits_2_x_min_y_min_x_max_y_max(bbox, image.shape[:2])
-
+            # logger.info(str(cls_id) + " ---- " + str(bbox))
+            # exit(0)
             x_min, y_min, x_max, y_max = bbox
-            x_min = int(x_min * ratio_x)
-            y_min = int(y_min * ratio_y)
-            x_max = int(x_max * ratio_x)
-            y_max = int(y_max * ratio_y)
+            # x_min = int(x_min * ratio_x)
+            # y_min = int(y_min * ratio_y)
+            # x_max = int(x_max * ratio_x)
+            # y_max = int(y_max * ratio_y)
 
-            if x_min < shift_x \
-                or y_min < shift_y \
-                or x_max > (shift_x + self.img_size[0]) \
-                or y_max > (shift_y + self.img_size[1]):
-                continue
+            # if x_min < shift_x \
+            #     or y_min < shift_y \
+            #     or x_max > (shift_x + self.img_size[0]) \
+            #     or y_max > (shift_y + self.img_size[1]):
+            #     continue
 
-            x_min = (x_min - shift_x) / self.r_x
-            y_min = (y_min - shift_y) / self.r_y
-            x_max = (x_max - shift_x) / self.r_x
-            y_max = (y_max - shift_y) / self.r_y
+            # x_min = (x_min - shift_x) / self.r_x
+            # y_min = (y_min - shift_y) / self.r_y
+            # x_max = (x_max - shift_x) / self.r_x
+            # y_max = (y_max - shift_y) / self.r_y
+
+            x_min = x_min / self.r_x
+            y_min = y_min / self.r_y
+            x_max = x_max / self.r_x
+            y_max = y_max / self.r_y
 
             area = (x_max - x_min) * (y_max - y_min)
             label2[obj_id] = torch.tensor(
-                [x_min, y_min, x_max, y_max, area, 1, cls_id])
+                [x_min, y_min, x_max, y_max, area, 1, cls_id]
+            )
 
             x_centre = int(x_min + (x_max - x_min) / 2)
             y_centre = int(y_min + (y_max - y_min) / 2)
@@ -316,8 +329,8 @@ class Dataset(BaseDataset):
                 logger.info("Maximum number of objects reached !!!!!")
                 break
 
-        image_r = image_r[shift_y:(shift_y + self.img_size[1]),
-                          shift_x:(shift_x + self.img_size[0])]
+        # image_r = image_r[shift_y:(shift_y + self.img_size[1]),
+        #                   shift_x:(shift_x + self.img_size[0])]
         return image_r, label, label2
 
 
@@ -367,6 +380,7 @@ class CocoDataCollector:
     def load_config_file(self):
         """
         Function to load content of the config file
+        :rtype: typing.Dict[str, object]
         """
         with open(self.config_file, mode='r', encoding='utf-8') as f:
             content = yaml.safe_load(f)
@@ -426,9 +440,10 @@ class CocoDataCollector:
         classes = []
         bboxes = []
         for image_file in image_files:
-            file_path_without_ext = get_fn_without_ext(image_file)
+            file_name = os.path.basename(image_file)
+            file_name_without_ext = get_fn_without_ext(file_name)
             label_file = os.path.join(
-                labels_dir, f"{file_path_without_ext}.txt"
+                labels_dir, f"{file_name_without_ext}.txt"
             )
             if not os.path.isfile(label_file):
                 logger.warning(f"No such label file at: {label_file}")
@@ -437,8 +452,8 @@ class CocoDataCollector:
             images.append(image_file)
             classes.append(class_ids)
             bboxes.append(boxes)
-
-        bboxes = np.asarray(bboxes, dtype=np.float32)
+            # logger.info("--------------->" + str(boxes.shape))
+        # bboxes = np.asarray(bboxes, dtype=np.float32)
         return images, classes, bboxes
 
     def collect(self):
@@ -458,16 +473,20 @@ class CocoDataCollector:
 
         if 'names' not in config:
             raise ValueError("The list of the class names is not defined.")
+        names_list = config['names']
+        self.class_names =  names_list if isinstance(names_list, list) \
+            else list(names_list.values())  # noqa
+        logger.info(f"Class names found: {','.join(self.class_names)}")
 
         self.train_images_dir = str(
-            os.path.join(self.dataset_dir, config['train'])
+            os.path.join(self.dataset_dir, str(config['train']))
         )
         self.val_images_dir = str(
-            os.path.join(self.dataset_dir, config['val'])
+            os.path.join(self.dataset_dir, str(config['val']))
         )
         if 'test' in config:
             self.test_images_dir = str(
-                os.path.join(self.dataset_dir, config['test'])
+                os.path.join(self.dataset_dir, str(config['test']))
             )
             logger.info(
                 "The images of test directory is located at:"
@@ -482,9 +501,6 @@ class CocoDataCollector:
             "The images of validation directory is located at:"
             f" {self.val_images_dir}"
         )
-
-        self.class_names = config['names']
-        logger.info(f"The class names found: {','.join(self.class_names)}")
 
         train_label_dir = config['train'].replace('images', 'labels')
         val_label_dir = config['val'].replace('images', 'labels')
@@ -519,7 +535,7 @@ class CocoDataCollector:
         train_image_files = os.listdir(self.train_images_dir)
         val_image_files = os.listdir(self.val_images_dir)
         test_image_files = []
-        if self.test_labels_dir:
+        if self.test_images_dir and os.path.isdir(self.test_images_dir):
             test_image_files.extend(os.listdir(self.test_images_dir))
 
         # Build full file path to each image file listed from sub-datasets
