@@ -16,7 +16,7 @@ full-gpu-install:
 	chmod +x vae_train
 	chmod +x vae_fine_tuning
 
-full-install:
+install:
 	pip install --upgrade pip
 	pip install torch==2.6.0 torchvision --index-url "https://download.pytorch.org/whl/cpu" && \
 	pip install -r requirements.txt
