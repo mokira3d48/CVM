@@ -723,9 +723,9 @@ class Model(VAE):
 
     def save_decoder(self, file_path):
         """
-        Function to save decoder model weights into file.
+        Function to save decoder model weights into file
 
-        :params file_path: The model file path.
+        :params file_path: The model file path
         :type file_path: `str`
         """
         os.makedirs(file_path, exist_ok=True)
