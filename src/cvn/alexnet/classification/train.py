@@ -191,7 +191,7 @@ class AlexNet(nn.Module):
 
     def forward(self, x):
         feature_maps = self.backbone(x)
-        feature_maps = torch.flatten(feature_maps)
+        feature_maps = torch.flatten(feature_maps, 1)
         x = self.post_backbone(feature_maps)
         out = self.fc(x)
         return out
@@ -417,14 +417,16 @@ def fine_tune_model(
 # DATASET IMPLEMENTATION
 ###############################################################################
 
-def read_image(image_path):
+def fix_image_rotation(image_path, output_path=None):
     """
     Fix image rotation based on EXIF orientation data
 
     :param image_path: Path to the input image
+    :param output_path: Path to save the corrected image (optional)
     :returns: Corrected image object
 
     :type image_path: `str`
+    :type output_path: `str`
     :rtype: numpy.ndarray
     """
     try:
@@ -462,6 +464,11 @@ def read_image(image_path):
                     image = image.rotate(270, expand=True)
                 elif orientation == 8:
                     image = image.rotate(90, expand=True)
+
+        # Save the corrected image if output path is provided
+        if output_path:
+            # Remove EXIF data to prevent further rotation issues
+            image.save(output_path, quality=95, optimize=True)
 
         return image
 
@@ -532,8 +539,11 @@ class Dataset(BaseDataset):
                 if not is_image_file:
                     continue
                 file_path = os.path.join(folder_path, file_name)
+                #fix_image_rotation(file_path, file_path)
+
                 paths.append(file_path)
                 classes.append(class_idx)
+
                 loader.set_postfix(files=f"{(fid + 1)}/{file_count}")
 
             loader.write(f"Class {class_name} of {file_count} is processed.")
@@ -551,9 +561,8 @@ class Dataset(BaseDataset):
 
     def __getitem__(self, idx):
         path, target = self.samples[idx]
-        # img = Image.open(f).convert('RGB')
 
-        img = read_image(path)
+        img = Image.open(path).convert('RGB')
         img = img.resize(self.img_size)
 
         if self.transform:
@@ -816,9 +825,6 @@ class Training(Model):
         logits = self.forward(images)
         predictions, _ = self.output(logits)
 
-        print(logits)
-        print(targets)
-
         # Comput losses
         loss = self.cross_entropy(logits, targets)
 
@@ -843,7 +849,7 @@ class Training(Model):
         self.recall_score += recall
         self.f1_score += f1
 
-        self.gac += len(images)
+        self.gac += images.shape[0]
         if self.gac >= self.gas or optimize:
             self.optimizer.step()
             self.optimizer.zero_grad()
@@ -998,7 +1004,7 @@ def parse_argument():
     """
     Command line argument parsing
     """
-    parser = argparse.ArgumentParser(prog="VAE Train")
+    parser = argparse.ArgumentParser(prog="ALEX-NET Training")
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('-dt', '--train-data-dir', type=str, required=True)
     parser.add_argument('-dv', '--val-data-dir', type=str, required=True)
