@@ -9,6 +9,7 @@ import json
 import argparse
 import logging
 from time import time
+from shutil import copy
 
 import yaml
 import numpy as np
@@ -16,10 +17,11 @@ import matplotlib.pyplot as plt
 from jinja2.optimizer import optimize
 from tqdm import tqdm
 from PIL import Image, ExifTags
-from sklearn.metrics import confusion_matrix, classification_report
-from sklearn.model_selection import train_test_split
+# from sklearn.metrics import confusion_matrix, classification_report
+from sklearn import metrics as m
 
 import torch
+# import torch.nn.functional as F
 from torch import nn
 from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -93,6 +95,15 @@ class ModelConfig:
         with open(file_path, mode='w', encoding='utf-8') as f:
             yaml.dump(config_data, f)
 
+    def load_state_dict(self, state_dict):
+        """
+        Method to load state dict and update model config value
+
+        :param state_dict: The dictionary of model config attribute
+        :type state_dict: typing.Dict[str, object]
+        """
+        self.__dict__.update(state_dict)
+
     def load(self, file_path):
         """
         Load the attribute values from a YAML file
@@ -102,7 +113,7 @@ class ModelConfig:
         """
         with open(file_path, mode='r', encoding='utf-8') as f:
             config_data = yaml.safe_load(f)
-            self.__dict__.update(config_data)
+            self.load_state_dict(config_data)
 
 
 class AlexNet(nn.Module):
@@ -160,7 +171,10 @@ class AlexNet(nn.Module):
         self._initialize_weights()
 
     def _evaluate_features_map_shape(self):
-        x = torch.zeros((1, 3, 96, 128))
+        ch = self.config.img_channels
+        size = self.config.img_size
+
+        x = torch.zeros((1, ch, *size))
         y = self.backbone(x)
         return y.shape
 
@@ -177,6 +191,7 @@ class AlexNet(nn.Module):
 
     def forward(self, x):
         feature_maps = self.backbone(x)
+        feature_maps = torch.flatten(feature_maps)
         x = self.post_backbone(feature_maps)
         out = self.fc(x)
         return out
@@ -260,6 +275,7 @@ class Output(nn.Module):
 
 
 class Model(AlexNet):
+
     def __init__(self, config):
         super().__init__(config)
         self.input = Input(
@@ -285,7 +301,7 @@ class Model(AlexNet):
         B = batch_size
         img_channels = self.config.img_channels
         img_size = self.config.img_size
-        input_image = torch.randn((B, img_channels, img_size))
+        input_image = torch.randn((B, img_channels, *img_size))
         input_image = input_image.to(model_device)
         results = summary(self, input_data=input_image)
         return results
@@ -543,4 +559,507 @@ class Dataset(BaseDataset):
         if self.transform:
             img = self.transform(img)
 
+        img = np.array(img)
+        img = torch.as_tensor(img)
+        target = torch.as_tensor(target)
+
         return img, target
+
+
+###############################################################################
+# METRICS IMPLEMENTATION
+###############################################################################
+
+
+class AvgMeter:
+
+    def __init__(self, val=0):
+        self.total = val
+        self.count = 0
+
+    def reset(self):
+        self.total = 0.0
+        self.count = 0
+
+    def __add__(self, other):
+        """
+        Add function
+
+        :type other: `float`|`int`
+        """
+        self.total += other
+        self.count += 1
+        return self
+
+    def __radd__(self, other):
+        return self.__add__(other)
+
+    def avg(self):
+        if self.count > 0:
+            return self.total / self.count
+        else:
+            return 0.0
+
+    def __str__(self):
+        return str(self.total)
+
+
+class Training(Model):
+
+    @classmethod
+    def load(cls, file_path=None, checkpoint_file=None):
+        """
+        Static method to load model state dict from files or checkpoints
+
+        :param file_path: The model file contained the weights and config;
+        :param checkpoint_file: The file path to the training checkpoint;
+        :returns: The instance of the model.
+
+        :type file_path: `str`
+        :type checkpoint_file: `str`
+        :rtype: Trainer
+        """
+        instance = None
+        if file_path:
+            instance = super().load(file_path)
+
+        if not instance and os.path.isfile(checkpoint_file):
+            checkpoint = torch.load(
+                checkpoint_file,  weights_only=False, map_location='cpu'
+            )
+
+            config = ModelConfig()
+            if 'model_config' in checkpoint:
+                config.load_state_dict(checkpoint['model_config'])
+                logger.info("Model config is loaded from checkpoint!")
+
+            instance = cls(config)
+            if 'model_state_dict' in checkpoint:
+                instance.load_state_dict(checkpoint['model_state_dict'])
+                logger.info("Model state dict is loaded from checkpoint!")
+
+        return instance
+
+    def __init__(self, config=None):
+        super().__init__(config)
+
+        self.train_loader = None
+        self.val_loader = None
+
+        self.cross_entropy = None
+        self.optimizer = None
+        self.lr_scheduler = None
+
+        self.train_losses = {}
+        self.val_losses = {}
+        self.cross_entropy_loss = AvgMeter()
+        self.precision_score = AvgMeter()
+        self.recall_score = AvgMeter()
+        self.f1_score = AvgMeter()
+
+        self.gas = 128  # Gradiant Accumulation Steps
+        self.seed = 42  # Seed number for random generation
+        self.num_epochs = 1
+        self.batch_size = 1
+
+        self.gac = 0  # Gradient Accumulation Count
+
+        self.checkpoint_dir = "checkpoints"
+        self.resume_ckpt = None
+        self.best_model = None
+        self.epoch = 0
+
+    def compile(self, args):
+        """
+        Initialization of training process
+        ----------------------------------
+
+        :type args: `argparse.Namespace`
+        :rtype: `None`
+        """
+        # torch.manual_seed(args.seed)
+        # np.random.seed(args.seed)
+        set_seed(args.seed)
+
+        model_device = self.device()
+        logger.info(f"Device selected: \033[92m{model_device}\033[0m")
+
+        self.num_epochs = args.epochs
+        self.batch_size = args.batch_size
+        self.gas = args.gas
+
+        train_ds_dir = args.train_data_dir
+        val_ds_dir = args.val_data_dir
+        img_size = self.config.img_size
+
+        if not os.path.isdir(train_ds_dir):
+            raise FileNotFoundError(
+                f"No such training set directory at {train_ds_dir}"
+            )
+        if not os.path.isdir(val_ds_dir):
+            raise FileNotFoundError(
+                f"No such validation set directory at {val_ds_dir}"
+            )
+
+        train_dataset = Dataset.build(train_ds_dir, img_size=img_size)
+        val_dataset = Dataset.build(val_ds_dir, img_size=img_size)
+
+        # Create data loaders
+        self.train_loader = data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True
+        )
+        self.val_loader = data.DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False
+        )
+
+        # Set loss function
+        self.cross_entropy = nn.CrossEntropyLoss()
+
+        # Set up the optimizer
+        self.optimizer = torch.optim.AdamW(
+            self.parameters(), lr=args.learning_rate,
+            weight_decay=args.weight_decay
+        )
+
+        # Learning rate scheduler
+        self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
+            self.optimizer, step_size=3, gamma=0.1
+        )
+
+        self.resume_ckpt = args.resume
+        self.checkpoint_dir = args.checkpoint_dir
+        self.best_model = args.best_model
+
+    @staticmethod
+    def _update_losses(input_losses, output_losses):
+        """
+        Update losses value
+        """
+        for key, val in input_losses.items():
+            if key in output_losses:
+                output_losses[key] += val
+            else:
+                new_loss = AvgMeter(val)
+                output_losses[key] = new_loss
+
+    @staticmethod
+    def print_results(res):
+        """
+        Function of average meter losses
+        """
+        string = ''
+        for key, val in res.items():
+            string += f"{key}: {val:.8f} "
+        return string
+
+    @staticmethod
+    def add_to_epoch_results(epc_res, new_res):
+        for key, val in epc_res.items():
+            if key in epc_res:
+                epc_res[key].append(new_res[key])
+            else:
+                epc_res[key] = [new_res[key]]
+
+    def checkpoint(self, **kwargs):
+        checkpoint = {
+            "model_config": self.config.state_dict(),
+            "model_state_dict": self.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
+            "epoch": self.epoch,
+            "train_losses": self.train_losses,
+            "val_losses": self.val_losses,
+            # "best_performance": self.best_performance,
+            **kwargs
+        }
+
+        file_path1 = os.path.join(self.checkpoint_dir, "checkpoint.pth")
+        file_path2 = os.path.join(
+            self.checkpoint_dir, f"checkpoint_{self.epoch}.pth"
+        )
+        torch.save(checkpoint, file_path1)
+        copy(file_path1, file_path2)
+        logger.info("Checkpoint done successfully!")
+
+        if self.epoch >= 2:
+            old_checkpoint_file = os.path.join(
+                self.checkpoint_dir, f"checkpoint_{self.epoch - 2}.pth"
+            )
+            if os.path.isfile(old_checkpoint_file):
+                os.remove(old_checkpoint_file)
+                logger.info(f"{old_checkpoint_file} checkpoint is removed.")
+
+    def load_checkpoint(self):
+        if not self.resume_ckpt:
+            return
+        if not os.path.isfile(self.resume_ckpt):
+            logger.info(f"No such checkpoint file at {self.resume_ckpt}")
+            return
+
+        ckpt_data = torch.load(
+            self.resume_ckpt, weights_only=False, map_location='cpu'
+        )
+        self.optimizer.load_state_dict(ckpt_data['optimizer_state_dict'])
+        self.lr_scheduler.load_state_dict(ckpt_data['lr_scheduler_state_dict'])
+        self.epoch = ckpt_data['epoch'] + 1
+        self.train_losses = ckpt_data['train_losses']
+        self.val_losses = ckpt_data['val_losses']
+        # self.best_performance = ckpt_data['best_performance']
+        logger.info(f"Checkpoint loaded successfully from {self.resume_ckpt}!")
+
+    def train_step(self, images, targets, write_fn, optimize=False):
+        """
+        Training method on one batch
+        """
+        # Forward pass
+        images = self.input(images)
+        logits = self.forward(images)
+        predictions, _ = self.output(logits)
+
+        print(logits)
+        print(targets)
+
+        # Comput losses
+        loss = self.cross_entropy(logits, targets)
+
+        # Backward pass
+        loss.backward()
+
+        self.cross_entropy_loss += loss.item()
+
+        y_true = targets.cpu().detach().numpy()
+        y_pred = predictions.cpu().detach().numpy()
+
+        # Compute metrics
+        args = dict(
+            y_true=y_true, y_pred=y_pred, average='macro', zero_division=0
+        )
+        precision = m.precision_score(**args)
+        recall = m.recall_score(**args)
+        f1 = m.f1_score(**args)
+
+        self.cross_entropy_loss += loss.item()
+        self.precision_score += precision
+        self.recall_score += recall
+        self.f1_score += f1
+
+        self.gac += len(images)
+        if self.gac >= self.gas or optimize:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+            write_fn(
+                "\t* Optim step"
+                f" - cross_entropy loss: {self.cross_entropy_loss.avg():.8f}"
+                f" - precision score: {self.precision_score.avg():5.3f}"
+                f" - recall score: {self.recall_score.avg():5.3f}"
+                f" - f1 score: {self.f1_score.avg():5.3f}")
+            self.gac = 0
+
+    def train_one_epoch(self):
+        """
+        Method of training on one epoch
+        """
+        model_device = self.device()
+        loss_data = {}
+
+        self.cross_entropy_loss.reset()
+        self.precision_score.reset()
+        self.recall_score.reset()
+        self.f1_score.reset()
+
+        length = len(self.train_loader)
+        desc = "\033[44m TRAINING\033[0m"
+        loader = tqdm(self.train_loader, desc=desc)
+        write_fn = loader.write
+
+        self.train()
+        self.optimizer.zero_grad()
+        for index, (images, targets) in enumerate(loader):
+            images = images.to(model_device)  # noqa
+            targets = targets.to(model_device)
+
+            # At last iteration, the gradient accumulation count can not
+            # be equal to gradient accumulation step, so we must perform
+            # optimization step when we are at the last iteration (length - 1)
+            is_last_index = index >= (length - 1)
+            self.train_step(images, targets, write_fn, is_last_index)
+
+            loss_data = {
+                "cross_entropy_loss": self.cross_entropy_loss.avg(),
+                "precision": self.precision_score.avg(),
+                "recall": self.recall_score.avg(),
+                "f1": self.f1_score.avg()}
+            loader.set_postfix(loss_data)
+
+        return loss_data
+
+    def validate(self):
+        model_device = self.device()
+        loss_data = {}
+        self.cross_entropy_loss.reset()
+        self.precision_score.reset()
+        self.recall_score.reset()
+        self.f1_score.reset()
+
+        self.eval()
+        with torch.no_grad():
+            desc = "\033[43m VALIDATION\033[0m"
+            loader = tqdm(self.val_loader, desc=desc)
+
+            for images, targets in loader:
+                images = images.to(model_device)  # noqa
+                targets = targets.to(model_device)
+
+                # Forward pass
+                images = self.input(images)
+                logits = self.forward(images)
+                predictions, _ = self.output(logits)
+
+                # Comput losses
+                loss = self.cross_entropy(logits, targets)
+
+                y_true = targets.cpu().detach().numpy()
+                y_pred = predictions.cpu().detach().numpy()
+
+                # Compute metrics
+                args = dict(
+                    y_true=y_true, y_pred=y_pred, average='macro',
+                    zero_division=0
+                )
+                precision = m.precision_score(**args)
+                recall = m.recall_score(**args)
+                f1 = m.f1_score(**args)
+
+                self.cross_entropy_loss += loss.item()
+                self.precision_score += precision
+                self.recall_score += recall
+                self.f1_score += f1
+
+                loss_data.update({
+                    "cross_entropy": self.cross_entropy_loss.avg(),
+                    "precision": self.precision_score.avg(),
+                    "recall": self.recall_score.avg(),
+                    "f1": self.f1_score.avg()})
+                loader.set_postfix(loss_data)
+
+        return loss_data
+
+    def fit(self):
+        """
+        Training process
+        ----------------
+
+        Run the training loop and returns the results
+        formatted as dictionary
+
+        :rtype: `dict`
+        """
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.load_checkpoint()
+
+        for epoch in range(self.epoch, self.num_epochs):
+            self.epoch = epoch
+            logger.info(f'Epoch: {epoch + 1} / {self.num_epochs}:')
+
+            train_losses = self.train_one_epoch()
+
+            # Update the learning rate
+            self.lr_scheduler.step()
+
+            # Add losses to train losses epochs
+            # Save checkpoint with the current model state
+            self.add_to_epoch_results(self.train_losses, train_losses)
+
+            logger.info(f'{self.print_results(train_losses)}')
+
+            # Make checkpoint after training
+            self.checkpoint()
+
+            val_losses = self.validate()
+
+            self.add_to_epoch_results(self.val_losses, val_losses)
+
+            logger.info(f'{self.print_results(val_losses)}')
+
+            # Make checkpoint after validation
+            self.checkpoint()
+
+            if epoch != (self.num_epochs - 1):
+                # Epochs are remaining
+                logger.info(("-" * 80) + "\n")
+
+        self.save("fine_tuning_model")
+        logger.info(
+            "Fine-tuning model is saved at\033[92m fine_tuning_mode\033[0m.")
+
+
+def parse_argument():
+    """
+    Command line argument parsing
+    """
+    parser = argparse.ArgumentParser(prog="VAE Train")
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('-dt', '--train-data-dir', type=str, required=True)
+    parser.add_argument('-dv', '--val-data-dir', type=str, required=True)
+    parser.add_argument('-b', '--batch-size', type=int, default=1)
+
+    parser.add_argument('--img-size', type=int, default=224)
+    parser.add_argument('--img-channels', type=int, default=3)
+    parser.add_argument('--dropout', type=float, default=0.2)
+    parser.add_argument('-nc', '--num-classes', type=int, default=10)
+
+    parser.add_argument('-n', '--epochs', type=int, default=2)
+    parser.add_argument('-lr', '--learning-rate', type=float, default=1e-4)
+    parser.add_argument('--weight-decay', type=float, default=0.0005)
+    parser.add_argument('-gas', type=int, default=128)
+
+    parser.add_argument('-r', "--resume", type=str)
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
+    parser.add_argument('--model-file', type=str, help="Alex-net model")
+    parser.add_argument('--best-model', type=str, default="best")
+
+    args = parser.parse_args()
+    logger.info("Training arguments:")
+    for arg, value in vars(args).items():
+        logger.info(f"  {arg}: {value}")
+    return args
+
+
+def main():
+    """
+    Main function to run train process
+    """
+    args = parse_argument()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model_file = args.model_file
+    checkpoint = args.resume
+    model = None
+    if checkpoint:
+        model = Training.load(checkpoint_file=checkpoint)
+    if not model and model_file:
+        model = Training.load(model_file)
+    if not model:
+        config = ModelConfig()
+        config.img_channels = args.img_channels
+        config.img_size = [args.img_size, args.img_size]
+        config.num_classes = args.num_classes
+        config.dropout_prob = args.dropout
+
+        model = Training(config)
+
+    model = model.to(device)
+
+    model.compile(args)
+    model.summary(args.batch_size)
+    model.fit()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+        exit(0)
+    except KeyboardInterrupt:
+        print("\033[91mCanceled by user!\033[0m")
+        exit(125)
