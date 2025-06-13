@@ -1,6 +1,35 @@
 #!/usr/bin/env python3
 #-*- encoding: utf8 -*-
 
+"""
++=============================================================================+
+|          ALEX-NET CLASSIFICATION TRAINING IMPLEMENTATION                    |
++=============================================================================+
+
+
+MIT License
+
+Copyright (c) 2025 Doctor Mokira
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
 __version__ = '0.1.0'
 __auther__ = 'Doctor Mokira'
 
@@ -8,7 +37,7 @@ import os
 import json
 import argparse
 import logging
-from time import time
+import time
 from shutil import copy
 
 import yaml
@@ -35,13 +64,17 @@ from torchinfo import summary
 logging.basicConfig(
     level=logging.INFO,
     # format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    format='%(asctime)s - - %(levelname)s - %(message)s',
+    format='%(asctime)s - - \033[95m%(levelname)s\033[0m - %(message)s',
     handlers=[
         logging.FileHandler("alex_net_train.log"),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def clear_console():
+    os.system('cls' if os.name == 'nt' else 'clear')
 
 
 def set_seed(seed=42):
@@ -356,14 +389,14 @@ class Model(AlexNet):
 
 
 def fine_tune_model(
-    pretrained_model_path, num_new_classes, lr, freeze_feature_layers=True,
+    model, num_new_classes, lr, freeze_feature_layers=True,
     weight_decay=0.005
 ):
     """
     Load a pre-trained model and modify it for fine-tuning
     on a new dataset with different number of classes.
 
-    :param pretrained_model_path: Path to the pre-trained model file path.
+    :param model: Instance of the pre-trained model.
     :param num_new_classes: Number of classes in the new dataset.
     :param lr: The base learning rate will be used to config optimizer
         with the deference layers learning rate.
@@ -371,7 +404,7 @@ def fine_tune_model(
         extraction layers.
     :param weight_decay: The weight decay value.
 
-    :type pretrained_model_path: `str`
+    :type model: Model
     :type num_new_classes: `int`
     :type lr: `float`
     :type freeze_feature_layers: `bool`
@@ -384,7 +417,7 @@ def fine_tune_model(
     """
     # Load the checkpoint
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = Model.load(pretrained_model_path)
+    # model = Model.load(pretrained_model_path)
 
     model.fc = nn.Linear(4096, num_new_classes)
     model.config.num_classes = num_new_classes
@@ -557,7 +590,8 @@ class Dataset(BaseDataset):
         return instance
 
     def __len__(self):
-        return len(self.samples)
+        return 1000
+        # return len(self.samples)
 
     def __getitem__(self, idx):
         path, target = self.samples[idx]
@@ -613,6 +647,135 @@ class AvgMeter:
         return str(self.total)
 
 
+class Metric:
+
+    @classmethod
+    def load(cls, state_dict, new_num_epochs=None):
+        """
+        Method to load metric data from state dict
+
+        :param state_dict: The state dict which contents the metrics data
+        :param new_num_epochs: The new value of number of epochs
+        :return: An instance of Metric with loaded data. None value
+          is returned, when the state dict provided is empty or None.
+
+        :type state_dict: `dict`
+        :type new_num_epochs: `int`
+        :rtype: Metric
+        """
+        if not state_dict:
+            return
+        num_epochs = state_dict['num_epochs']
+        num_channels = state_dict['num_channels']
+        if new_num_epochs and new_num_epochs > num_epochs:
+            instance = cls(new_num_epochs, num_channels)
+        else:
+            instance = cls(num_epochs, num_channels)
+        instance.channels = state_dict['channels']
+
+        del state_dict['num_epochs']
+        del state_dict['num_channels']
+        del state_dict['channels']
+
+        for name, values in state_dict.items():
+            metric = instance.__dict__[name]
+            for i in range(instance.num_channels):
+                metric[i, :num_epochs] = values[i, :num_epochs]
+            # logger.info(f"\n\t{name}: {metric}")
+        logger.info("Metric state dict is loaded successfully")
+        return instance
+
+    def __init__(self, num_epochs, num_channels=2):
+        self.num_epochs = num_epochs
+        self.num_channels = num_channels
+
+        self.channels = [f"ch_{c}" for c in range(self.num_channels)]
+
+        self.cross_entropy_loss = self.new_buffer()
+        self.precision_score = self.new_buffer()
+        self.recall_score = self.new_buffer()
+        self.f1_score = self.new_buffer()
+
+    def new_buffer(self):
+        bf = np.zeros((self.num_channels, self.num_epochs))
+        bf[:] = np.nan
+        return bf
+
+    def channel_id(self, name):
+        if name not in self.channels:
+            raise ValueError(f"No channel name '{name}' found")
+        return self.channels.index(name)
+
+    def __setitem__(self, epoch, metric_values):
+        if not (0 <= epoch < self.num_epochs):
+            logger.warning(
+                "Epoch indexed is out of range. The max epoch indexable"
+                f" is {self.num_epochs}"
+            )
+            return
+
+        for m_name, m_values in metric_values.items():
+            if not hasattr(self, m_name):
+                logger.warning(f"Metric named {m_name} is not defined")
+                continue
+            if isinstance(m_values, dict):
+                for chn, m_value in m_values.items():
+                    chi = self.channel_id(chn)
+                    self.__dict__[m_name][chi, epoch] = m_value
+            elif isinstance(m_values, list):
+                if len(m_values) != self.num_channels:
+                    raise ValueError(
+                        "The length of metric values list must be equal"
+                        f"to number channels ({self.num_channels})"
+                    )
+                for i in range(self.num_channels):
+                    self.__dict__[m_name][i, epoch] = m_values[i]
+
+    def state_dict(self):
+        """
+        Method that is used to return the state dict
+
+        :rtype: `dict`
+        """
+        return self.__dict__
+
+    def plot(self, save_path):
+        """
+        Plot and save training curves
+        """
+        plt.figure(figsize=(12, 10))
+
+        # Plot losses
+        plt.subplot(2, 1, 1)
+        plt.plot(self.epochs, self.cross_entropy_losses, label='Train Loss')
+        plt.plot(self.epochs, self.val_losses, label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training and Validation Loss')
+        plt.legend()
+        plt.grid(True)
+
+        # Plot angle errors
+        plt.subplot(2, 1, 2)
+        plt.plot(epochs, self.train_angles, label='Train Angle Error (rad)')
+        plt.plot(epochs, self.val_angles, label='Validation Angle Error (rad)')
+        plt.xlabel('Epoch')
+        plt.ylabel('Angle Error (radians)')
+        plt.title('Training and Validation Angle Error')
+        plt.legend()
+        plt.grid(True)
+
+        # Save the figure
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+
+
+###############################################################################
+# TRAINING PROCESS
+###############################################################################
+
+
 class Training(Model):
 
     @classmethod
@@ -655,6 +818,7 @@ class Training(Model):
         self.train_loader = None
         self.val_loader = None
 
+        self.metric = None
         self.cross_entropy = None
         self.optimizer = None
         self.lr_scheduler = None
@@ -776,8 +940,9 @@ class Training(Model):
             "optimizer_state_dict": self.optimizer.state_dict(),
             "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
             "epoch": self.epoch,
-            "train_losses": self.train_losses,
-            "val_losses": self.val_losses,
+            # "train_losses": self.train_losses,
+            # "val_losses": self.val_losses,
+            "metric_state_dict": self.metric.state_dict(),
             # "best_performance": self.best_performance,
             **kwargs
         }
@@ -811,8 +976,11 @@ class Training(Model):
         self.optimizer.load_state_dict(ckpt_data['optimizer_state_dict'])
         self.lr_scheduler.load_state_dict(ckpt_data['lr_scheduler_state_dict'])
         self.epoch = ckpt_data['epoch'] + 1
-        self.train_losses = ckpt_data['train_losses']
-        self.val_losses = ckpt_data['val_losses']
+        # self.train_losses = ckpt_data['train_losses']
+        # self.val_losses = ckpt_data['val_losses']
+        self.metric = Metric.load(
+            ckpt_data.get('metric_state_dict'), self.num_epochs
+        )
         # self.best_performance = ckpt_data['best_performance']
         logger.info(f"Checkpoint loaded successfully from {self.resume_ckpt}!")
 
@@ -893,9 +1061,10 @@ class Training(Model):
 
             loss_data = {
                 "cross_entropy_loss": self.cross_entropy_loss.avg(),
-                "precision": self.precision_score.avg(),
-                "recall": self.recall_score.avg(),
-                "f1": self.f1_score.avg()}
+                "precision_score": self.precision_score.avg(),
+                "recall_score": self.recall_score.avg(),
+                "f1_score": self.f1_score.avg()
+            }
             loader.set_postfix(loss_data)
 
         return loss_data
@@ -942,11 +1111,14 @@ class Training(Model):
                 self.recall_score += recall
                 self.f1_score += f1
 
-                loss_data.update({
-                    "cross_entropy": self.cross_entropy_loss.avg(),
-                    "precision": self.precision_score.avg(),
-                    "recall": self.recall_score.avg(),
-                    "f1": self.f1_score.avg()})
+                loss_data.update(
+                    {
+                        "cross_entropy_loss": self.cross_entropy_loss.avg(),
+                        "precision_score": self.precision_score.avg(),
+                        "recall_score": self.recall_score.avg(),
+                        "f1_score": self.f1_score.avg()
+                    }
+                )
                 loader.set_postfix(loss_data)
 
         return loss_data
@@ -964,6 +1136,11 @@ class Training(Model):
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.load_checkpoint()
 
+        if not self.metric:
+            self.metric = Metric(self.num_epochs, 2)
+            self.metric.channels[0] = "train"
+            self.metric.channels[1] = "val"
+
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
             logger.info(f'Epoch: {epoch + 1} / {self.num_epochs}:')
@@ -975,7 +1152,9 @@ class Training(Model):
 
             # Add losses to train losses epochs
             # Save checkpoint with the current model state
-            self.add_to_epoch_results(self.train_losses, train_losses)
+            # self._add_to_epoch_results(self.train_losses, train_losses)
+            self.metric[epoch] = {
+                name: {"train": value} for name, value in train_losses.items()}
 
             logger.info(f'{self.print_results(train_losses)}')
 
@@ -984,16 +1163,17 @@ class Training(Model):
 
             val_losses = self.validate()
 
-            self.add_to_epoch_results(self.val_losses, val_losses)
+            # self.add_to_epoch_results(self.val_losses, val_losses)
+            self.metric[epoch] = {
+                name: {"val": value} for name, value in val_losses.items()}
 
             logger.info(f'{self.print_results(val_losses)}')
-
-            # Make checkpoint after validation
-            self.checkpoint()
 
             if epoch != (self.num_epochs - 1):
                 # Epochs are remaining
                 logger.info(("-" * 80) + "\n")
+                time.sleep(2)
+                clear_console()
 
         self.save("fine_tuning_model")
         logger.info(
@@ -1003,6 +1183,8 @@ class Training(Model):
 def parse_argument():
     """
     Command line argument parsing
+
+    :rtype: argparse.Namespace
     """
     parser = argparse.ArgumentParser(prog="ALEX-NET Training")
     parser.add_argument('--seed', type=int, default=42)
@@ -1022,8 +1204,13 @@ def parse_argument():
 
     parser.add_argument('-r', "--resume", type=str)
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
-    parser.add_argument('--model-file', type=str, help="Alex-net model")
+    parser.add_argument('-m', '--model-file', type=str, help="Alex-Net model")
     parser.add_argument('--best-model', type=str, default="best")
+
+    parser.add_argument(
+        '--freeze-feature-layers', action="store_true",
+        help="Fine tuning model: Freeze feature layer--require_grad=True"
+    )
 
     args = parser.parse_args()
     logger.info("Training arguments:")
@@ -1046,6 +1233,10 @@ def main():
         model = Training.load(checkpoint_file=checkpoint)
     if not model and model_file:
         model = Training.load(model_file)
+        model = fine_tune_model(
+            model, args.num_classes, args.learning_rate,
+            args.freeze_feature_layers
+        )
     if not model:
         config = ModelConfig()
         config.img_channels = args.img_channels
