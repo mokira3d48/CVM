@@ -590,8 +590,8 @@ class Dataset(BaseDataset):
         return instance
 
     def __len__(self):
-        return 1000
-        # return len(self.samples)
+        # return 1000
+        return len(self.samples)
 
     def __getitem__(self, idx):
         path, target = self.samples[idx]
@@ -889,10 +889,12 @@ class Training(Model):
         self.cross_entropy = nn.CrossEntropyLoss()
 
         # Set up the optimizer
-        self.optimizer = torch.optim.AdamW(
-            self.parameters(), lr=args.learning_rate,
-            weight_decay=args.weight_decay
-        )
+        if self.optimizer is None:
+            self.optimizer = torch.optim.AdamW(
+                self.parameters(), lr=args.learning_rate,
+                weight_decay=args.weight_decay
+            )
+            logger.info("New instance of optimizer is created.")
 
         # Learning rate scheduler
         self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
@@ -1154,7 +1156,8 @@ class Training(Model):
             # Save checkpoint with the current model state
             # self._add_to_epoch_results(self.train_losses, train_losses)
             self.metric[epoch] = {
-                name: {"train": value} for name, value in train_losses.items()}
+                name: {"train": value} for name, value in train_losses.items()
+            }
 
             logger.info(f'{self.print_results(train_losses)}')
 
@@ -1165,19 +1168,21 @@ class Training(Model):
 
             # self.add_to_epoch_results(self.val_losses, val_losses)
             self.metric[epoch] = {
-                name: {"val": value} for name, value in val_losses.items()}
+                name: {"val": value} for name, value in val_losses.items()
+            }
 
             logger.info(f'{self.print_results(val_losses)}')
 
             if epoch != (self.num_epochs - 1):
                 # Epochs are remaining
                 logger.info(("-" * 80) + "\n")
-                time.sleep(2)
+                time.sleep(5)
                 clear_console()
 
-        self.save("fine_tuning_model")
+        self.save("saved_model")
         logger.info(
-            "Fine-tuning model is saved at\033[92m fine_tuning_mode\033[0m.")
+            "Fine-tuning model is saved at\033[92m saved_model\033[0m."
+        )
 
 
 def parse_argument():
@@ -1233,10 +1238,11 @@ def main():
         model = Training.load(checkpoint_file=checkpoint)
     if not model and model_file:
         model = Training.load(model_file)
-        model = fine_tune_model(
+        model, optimizer = fine_tune_model(
             model, args.num_classes, args.learning_rate,
-            args.freeze_feature_layers
+            args.freeze_feature_layers, args.weight_decay
         )
+        model.optimizer = optimizer
     if not model:
         config = ModelConfig()
         config.img_channels = args.img_channels

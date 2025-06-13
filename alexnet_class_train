@@ -4,5 +4,5 @@ python src/cvn/alexnet/classification/train.py \
   --img-channels 3 --img-size 224 \
   -n 10 -b 8 -lr 1e-4 -gas 384 \
   --checkpoint-dir "checkpoints" -r "checkpoints/checkpoint.pth"
-  # --model-file "saved_model"
+  # --model-file "saved_model" # --freeze-feature-layers
 
