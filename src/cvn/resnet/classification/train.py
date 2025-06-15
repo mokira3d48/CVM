@@ -66,7 +66,7 @@ logging.basicConfig(
     # format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     format='%(asctime)s - - \033[95m%(levelname)s\033[0m - %(message)s',
     handlers=[
-        logging.FileHandler("alex_net_train.log"),
+        logging.FileHandler("resnet_class_train.log"),
         logging.StreamHandler()
     ]
 )
