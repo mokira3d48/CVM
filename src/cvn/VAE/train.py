@@ -9,7 +9,7 @@
 
 MIT License
 
-Copyright (c) 2025 Dr Mokira
+Copyright (c) 2025 Doctor Mokira
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -723,9 +723,9 @@ class Model(VAE):
 
     def save_decoder(self, file_path):
         """
-        Function to save decoder model weights into file.
+        Function to save decoder model weights into file
 
-        :params file_path: The model file path.
+        :params file_path: The model file path
         :type file_path: `str`
         """
         os.makedirs(file_path, exist_ok=True)
