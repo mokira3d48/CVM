@@ -107,6 +107,7 @@ class ModelConfig:
         dropout_prob=0.2, in_channels=64,
         mean=[0.485, 0.456, 0.406],  # noqa
         std=[0.229, 0.224, 0.225],  # noqa
+        freeze_feature_layers=False,
     ):
         self.img_size = img_size
         self.img_channels = img_channels
@@ -115,6 +116,7 @@ class ModelConfig:
         self.in_channels = in_channels
         self.mean = mean
         self.std = std
+        self.freeze_feature_layers = freeze_feature_layers
 
     def state_dict(self):
         """
@@ -248,6 +250,11 @@ class ResNet50(nn.Module):
         ])
 
         self.fc = nn.Linear(512 * 4, self.num_classes)
+
+        # Freeze feature layers if specified
+        if self.config.freeze_feature_layers:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
 
     def _make_layer(self, num_residual, out_channels, stride):
         identity_downsample = None
@@ -485,6 +492,7 @@ def fine_tune_model(
         )
         for param in model.backbone.parameters():
             param.requires_grad = False
+        model.config.freeze_feature_layers = True
     else:
         backbone_params = list(model.backbone.parameters())
         # post_backbone_params = list(model.post_backbone.parameters())
