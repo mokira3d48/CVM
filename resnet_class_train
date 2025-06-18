@@ -2,6 +2,6 @@
 .venv/bin/python3 src/cvn/resnet/classification/train.py \
   -dt "data/train" -dv "data/val" -nc 35 \
   --img-channels 1 --img-size 96 \
-  -n 100 -b 8 -lr 1e-5 -gas 384 \
-  --checkpoint-dir "checkpoints" -r "checkpoints/checkpoint.pth"
-  # --model-file "saved_model" # --freeze-feature-layers
+  -n 10 -b 16 -lr 1e-4 -gas 384 \
+  --checkpoint-dir "checkpoints" -r "checkpoints/checkpoint.pth" \
+  --model-file "saved_model" --freeze-feature-layers

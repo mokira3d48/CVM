@@ -3,7 +3,7 @@
 
 """
 +=============================================================================+
-|          ALEX-NET CLASSIFICATION TRAINING IMPLEMENTATION                    |
+|          RESNET CLASSIFICATION TRAINING IMPLEMENTATION                    |
 +=============================================================================+
 
 
@@ -1290,15 +1290,18 @@ def main():
     model_file = args.model_file
     checkpoint = args.resume
     model = None
-    if checkpoint:
+
+    if checkpoint and os.path.isfile(checkpoint):
         model = Training.load(checkpoint_file=checkpoint)
-    if not model and model_file:
+
+    if not model and model_file and os.path.isdir(model_file):
         model = Training.load(model_file)
         model, optimizer = fine_tune_model(
             model, args.num_classes, args.learning_rate,
             args.freeze_feature_layers, args.weight_decay
         )
         model.optimizer = optimizer
+
     if not model:
         config = ModelConfig()
         config.img_channels = args.img_channels
