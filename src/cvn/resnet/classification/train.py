@@ -251,11 +251,6 @@ class ResNet50(nn.Module):
 
         self.fc = nn.Linear(512 * 4, self.num_classes)
 
-        # Freeze feature layers if specified
-        if self.config.freeze_feature_layers:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-
     def _make_layer(self, num_residual, out_channels, stride):
         identity_downsample = None
         layers = nn.ModuleList()
@@ -449,6 +444,12 @@ class Model(ResNet50):
         weights = torch.load(model_file, weights_only=True, map_location='cpu')
         instance.load_state_dict(weights)
         logger.info("Model weights loaded successfully!")
+
+        # Freeze feature layers if specified
+        if hparams.freeze_feature_layers:
+            for param in instance.backbone.parameters():
+                param.requires_grad = False
+
         return instance
 
 
@@ -581,14 +582,16 @@ class Dataset(BaseDataset):
     """
     Dataset implementation
 
-    :arg inputs: The list of features representing the image files
-    :arg targets: The list of the targets
-    :arg class_names: The list of available class names
-    :arg transform: The pipeline of image transformation
+    :arg inputs: The list of features representing the image files.
+    :arg targets: The list of the targets.
+    :arg img_size: The image size selected for all the dataset.
+    :arg class_names: The list of available class names.
+    :arg transform: The pipeline of image transformation.
 
     :type inputs: typing.List[str]
-    :type targets: typing.List[str]
-    :type targets:
+    :type targets: typing.List[int]
+    :type img_size: typing.Tuple[int, int]
+    :type class_names: typing.List[str]
     """
     def __init__(
         self, inputs, targets, class_names, img_size=(224, 224), transform=None
@@ -770,7 +773,7 @@ class Metric:
 
     def channel_id(self, name):
         if name not in self.channels:
-            raise ValueError(f"No channel name '{name}' found")
+            raise ValueError(f"No channel name '{name}' found.")
         return self.channels.index(name)
 
     def __setitem__(self, epoch, metric_values):
@@ -806,31 +809,42 @@ class Metric:
         """
         return self.__dict__
 
-    def plot(self, save_path):
+    def plot(self, save_path, num_epochs, fig_size=(12, 10)):
         """
-        Plot and save training curves
+        Plot and save training curves.
+
+        :param save_path: The path to file where we want to save the figure.
+        :param num_epochs: The number of epochs you want to visualize.
+        :param fig_size: T
+
+        :type save_path: str
+        :type num_epochs: int
+        :type fig_size: typing.tuple[int, int]
         """
-        plt.figure(figsize=(12, 10))
+        plt.figure(figsize=fig_size)
 
-        # Plot losses
-        plt.subplot(2, 1, 1)
-        plt.plot(self.epochs, self.cross_entropy_losses, label='Train Loss')
-        plt.plot(self.epochs, self.val_losses, label='Validation Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training and Validation Loss')
-        plt.legend()
-        plt.grid(True)
+        metric_values = [
+            (self.cross_entropy_loss, "Loss"),
+            (self.precision_score, "Precision (P)"),
+            (self.recall_score, "Recall (R)"),
+            (self.f1_score, "F1 score"),
+        ]
 
-        # Plot angle errors
-        plt.subplot(2, 1, 2)
-        plt.plot(epochs, self.train_angles, label='Train Angle Error (rad)')
-        plt.plot(epochs, self.val_angles, label='Validation Angle Error (rad)')
-        plt.xlabel('Epoch')
-        plt.ylabel('Angle Error (radians)')
-        plt.title('Training and Validation Angle Error')
-        plt.legend()
-        plt.grid(True)
+        num_metrics = len(metric_values)
+        epochs = range(num_epochs)
+
+        for i in range(num_metrics):
+            values, label = metric_values[i]
+
+            plt.subplot(num_metrics, 1, (i + 1))
+            for j, ch in enumerate(values):
+                plt.plot(epochs, ch[:num_epochs], label=self.channels[j])
+
+            plt.xlabel('Epoch')
+            plt.ylabel(label)
+            # plt.title('Training and Validation Loss')
+            plt.legend()
+            plt.grid(True)
 
         # Save the figure
         plt.tight_layout()
@@ -1200,6 +1214,7 @@ class Training(Model):
         :rtype: `dict`
         """
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        figure_fp = os.path.join(self.checkpoint_dir, 'results.jpg')
         self.load_checkpoint()
 
         if not self.metric:
@@ -1234,6 +1249,7 @@ class Training(Model):
             self.metric[epoch] = {
                 name: {"val": value} for name, value in val_losses.items()
             }
+            self.metric.plot(figure_fp, epoch + 1)
 
             logger.info(f'{self.print_results(val_losses)}')
 
@@ -1278,7 +1294,7 @@ def parse_argument():
 
     parser.add_argument(
         '--freeze-feature-layers', action="store_true",
-        help="Fine tuning model: Freeze feature layer--require_grad=True"
+        help="Fine tuning model: Freeze feature layer -- require_grad=True"
     )
 
     args = parser.parse_args()
@@ -1290,7 +1306,7 @@ def parse_argument():
 
 def main():
     """
-    Main function to run train process
+    Main function to run train process.
     """
     args = parse_argument()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
