@@ -3,7 +3,7 @@
 
 """
 +=============================================================================+
-|          ALEX-NET CLASSIFICATION TRAINING IMPLEMENTATION                    |
+|          RESNET CLASSIFICATION TRAINING IMPLEMENTATION                    |
 +=============================================================================+
 
 
@@ -66,7 +66,7 @@ logging.basicConfig(
     # format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     format='%(asctime)s - - \033[95m%(levelname)s\033[0m - %(message)s',
     handlers=[
-        logging.FileHandler("alex_net_train.log"),
+        logging.FileHandler("resnet_class_train.log"),
         logging.StreamHandler()
     ]
 )
@@ -104,7 +104,7 @@ class ModelConfig:
 
     def __init__(
         self, img_size=(224, 224), img_channels=3, num_classes=10,
-        dropout_prob=0.2,
+        dropout_prob=0.2, in_channels=64,
         mean=[0.485, 0.456, 0.406],  # noqa
         std=[0.229, 0.224, 0.225],  # noqa
         freeze_feature_layers=False,
@@ -113,6 +113,7 @@ class ModelConfig:
         self.img_channels = img_channels
         self.num_classes = num_classes
         self.dropout_prob = dropout_prob
+        self.in_channels = in_channels
         self.mean = mean
         self.std = std
         self.freeze_feature_layers = freeze_feature_layers
@@ -156,83 +157,134 @@ class ModelConfig:
             self.load_state_dict(config_data)
 
 
-class AlexNet(nn.Module):
-    """
-    ALEX-NET implementation
-
-    :type config: ModelConfig
-    """
-    def __init__(self, config):
+class Block(nn.Module):
+    def __init__(
+            self,
+            in_channels,
+            out_channels,
+            identity_downsample=None,
+            stride=1
+    ):
         super().__init__()
-        self.config = config if config else ModelConfig()
-        in_channels = self.config.img_channels
 
-        self.backbone = nn.Sequential(
-            nn.Conv2d(in_channels, 96, kernel_size=11, stride=4, padding=0),
-            nn.BatchNorm2d(96),
+        self.expansion = 4
+        self.conv1 = nn.Conv2d(
+            in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=stride,
+            padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv3 = nn.Conv2d(
+            out_channels, (out_channels * self.expansion), kernel_size=1,
+            stride=1, padding=0)
+        self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
+
+        self.relu = nn.ReLU()
+        self.identity_downsample = identity_downsample
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = self.relu(x)
+
+        if self.identity_downsample:
+            identity = self.identity_downsample(identity)
+
+        x = x + identity
+        return self.relu(x)
+
+
+class ResNet50(nn.Module):
+
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config if config is not None else ModelConfig()
+        self.img_channels = self.config.img_channels
+        self.num_classes = self.config.num_classes
+        self.in_channels = self.config.in_channels
+
+        # self.conv1 = nn.Conv2d(
+        #     self.img_channels, self.in_channels, kernel_size=7, stride=2,
+        #     padding=3
+        # )
+        # self.bn1 = nn.BatchNorm2d(64)
+        # self.relu = nn.ReLU()
+        #
+        # self.max_pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        #
+        # # ResNet Layers
+        # self.layer1 = self._make_layer(3, 64, stride=1)
+        # self.layer2 = self._make_layer(4, 128, stride=2)
+        # self.layer3 = self._make_layer(6, 256, stride=2)
+        # self.layer4 = self._make_layer(3, 512, stride=2)
+        # #: 2048 channels at the end
+
+        self.backbone = nn.ModuleList([
+            nn.Conv2d(
+                self.img_channels, self.in_channels, kernel_size=7, stride=2,
+                padding=3
+            ),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=3, stride=2),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
 
-            nn.Conv2d(96, 256, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=3, stride=2),
+            # ResNet Layers
+            self._make_layer(3, 64, stride=1),
+            self._make_layer(4, 128, stride=2),
+            self._make_layer(6, 256, stride=2),
+            self._make_layer(3, 512, stride=2),
+            #: 2048 channels at the end
 
-            nn.Conv2d(256, 384, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(384),
-            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1))
+        ])
 
-            nn.Conv2d(384, 384, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(384),
-            nn.ReLU(),
+        self.fc = nn.Linear(512 * 4, self.num_classes)
 
-            nn.Conv2d(384, 256, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=3, stride=2),
-        )
+    def _make_layer(self, num_residual, out_channels, stride):
+        identity_downsample = None
+        layers = nn.ModuleList()
 
-        features_map_size = self._evaluate_features_map_shape()
-        feature_map_dim = 1
-        for dim in features_map_size[1:]:
-            feature_map_dim *= dim
+        if stride != 1 or self.in_channels != out_channels * 4:
+            identity_downsample = nn.Sequential(
+                nn.Conv2d(
+                    self.in_channels, out_channels * 4, kernel_size=1,
+                    stride=stride),
+                nn.BatchNorm2d(out_channels * 4))
 
-        self.post_backbone = nn.Sequential(
-            nn.Linear(feature_map_dim, 4096),
-            nn.ReLU(),
-            nn.Dropout(self.config.dropout_prob),
-            nn.Linear(4096, 4096),
-            nn.ReLU(),
-        )
+        layers.append(Block(
+            self.in_channels, out_channels, identity_downsample, stride))
+        self.in_channels = out_channels * 4
 
-        self.fc = nn.Linear(4096, self.config.num_classes)
-
-        # Initialize weights
-        self._initialize_weights()
-
-    def _evaluate_features_map_shape(self):
-        ch = self.config.img_channels
-        size = self.config.img_size
-
-        x = torch.zeros((1, ch, *size))
-        y = self.backbone(x)
-        return y.shape
-
-    def _initialize_weights(self):
-        """Function of model weights initialization"""
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, mean=0, std=0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, mean=0, std=0.01)
-                nn.init.constant_(m.bias, 0)
+        for i in range(num_residual - 1):
+            layers.append(Block(self.in_channels, out_channels))
+        return nn.Sequential(*layers)
 
     def forward(self, x):
-        feature_maps = self.backbone(x)
-        feature_maps = torch.flatten(feature_maps, 1)
-        x = self.post_backbone(feature_maps)
+        """
+        Forward pass method
+
+        :param x: input image with dim: [batch_size, c, H, W].
+        :returns: The model prediction formated as a tensor with dim:
+          [batch_size, num_classes].
+
+        :type x: torch.Tensor
+        :rtype: torch.Tensor
+        """
+        for module in self.backbone:
+            x = module(x)
+
+        x = x.reshape(x.shape[0], -1)
         out = self.fc(x)
         return out
 
@@ -314,7 +366,7 @@ class Output(nn.Module):
         return class_ids, confidences
 
 
-class Model(AlexNet):
+class Model(ResNet50):
 
     def __init__(self, config):
         super().__init__(config)
@@ -432,7 +484,7 @@ def fine_tune_model(
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # model = Model.load(pretrained_model_path)
 
-    model.fc = nn.Linear(4096, num_new_classes)
+    model.fc = nn.Linear(512 * 4, num_new_classes)
     model.config.num_classes = num_new_classes
 
     if freeze_feature_layers:
@@ -444,14 +496,14 @@ def fine_tune_model(
         model.config.freeze_feature_layers = True
     else:
         backbone_params = list(model.backbone.parameters())
-        post_backbone_params = list(model.post_backbone.parameters())
+        # post_backbone_params = list(model.post_backbone.parameters())
         fc_params = list(model.fc.parameters())
         optimizer = optim.Adam(
             [
                 {'params': backbone_params, 'lr': lr * 0.01},
                 #: Very low learning rate for frozen feature layers
 
-                {'params': post_backbone_params, 'lr': lr * 0.1},
+                # {'params': post_backbone_params, 'lr': lr * 0.1},
                 #: Medium learning rate for FC1 and FC2
 
                 {'params': fc_params, 'lr': lr}
@@ -532,8 +584,8 @@ class Dataset(BaseDataset):
 
     :arg inputs: The list of features representing the image files.
     :arg targets: The list of the targets.
-    :arg class_names: The list of available class names.
     :arg img_size: The image size selected for all the dataset.
+    :arg class_names: The list of available class names.
     :arg transform: The pipeline of image transformation.
 
     :type inputs: typing.List[str]
@@ -1163,7 +1215,6 @@ class Training(Model):
         """
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         figure_fp = os.path.join(self.checkpoint_dir, 'results.jpg')
-
         self.load_checkpoint()
 
         if not self.metric:
